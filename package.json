@@ -1,0 +1,24 @@
+{
+  "name": "harness-gateway",
+  "displayName": "智能体网关",
+  "private": true,
+  "packageManager": "pnpm@10.26.2",
+  "description": "将 DeepSeek Harness 等智能体支持外网访问，统一管理和调度",
+  "scripts": {
+    "preinstall": "node -e \"if(!/pnpm/i.test(process.env.npm_config_user_agent||'')){console.error('[禁止] 本项目仅允许使用 pnpm 安装依赖，请运行: corepack enable && pnpm install');process.exit(1)}\"",
+    "build": "pnpm -r build",
+    "client": "pnpm --filter gateway-client start",
+    "dev": "pnpm -r dev",
+    "format": "pnpm -r format",
+    "server": "pnpm --filter gateway-server start",
+    "test": "pnpm -r test",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "devDependencies": {
+    "@stylistic/eslint-plugin": "^4.4.1",
+    "@types/node": "^20.19.43",
+    "eslint": "^9.39.5",
+    "eslint-plugin-import-x": "^4.17.1",
+    "eslint-plugin-unused-imports": "^4.4.1"
+  }
+}

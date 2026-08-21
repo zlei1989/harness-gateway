@@ -1,0 +1,232 @@
+# 智能体网关 · 客户端（packages/client）设计
+
+- 日期：2026-08-21
+- 状态：已确认（ brainstorming 逐节评审通过）
+- 范围：仅客户端包。服务端（packages/server）设计见《2026-08-21-gateway-server-design.md》。
+- 修订：2026-08-21 第二轮——补充多客户端路由配套：hostname/token/defaultPath 三属性、hello 握手帧、默认鉴权、`/__gateway__/auth-check` 短路。
+- 修订：2026-08-21 第三轮（设计评审修订）——`channel.close` 改双向；4409 定为进程级错误不重连；空体强制 `http.body.end` 收尾；headers 编码 `string | string[]`；`X-Forwarded-For` 注入与 `req.ip` 语义；`connect()` 首连重试 + `connectTimeoutMs`；`close()` 先关隧道再中止在途；token 流经隧道的安全提示；子协议回选校验。
+
+## 1. 背景与目标
+
+### 1.1 系统定位
+
+一套网关系统，分客户端与服务端两个独立 package。整体网络链路：
+
+```text
+用户浏览器 ──HTTP 或 WS──► 网关（服务端）──隧道协议──► 下游客户端 ──HTTP 或 WS──► 应用服务
+用户浏览器 ◄──响应──────────────────────────────────────────────┘
+```
+
+网关接收公网浏览器请求，通过与客户端之间的持久 WebSocket 隧道把请求转发给部署在应用服务旁的客户端；客户端再向应用服务发起真实 HTTP/WS 请求，并把响应沿原路带回。客户端部署在被代理应用的内网侧，出站连接网关，天然穿透 NAT/防火墙。
+
+### 1.2 客户端职责
+
+- 主动向网关建立并维持一条持久 WS 隧道（含自动重连、心跳）
+- 在单条隧道上多路复用并发 HTTP 请求与 WS 连接（自定义帧协议）
+- 把隧道通道桥接为对应用服务（upstream）的真实 HTTP/WS 请求，全双工流式透传
+- **权限管控**：所有请求（HTTP 与 WS 握手）在客户端经 `authorization` 钩子鉴权后才允许触达应用服务
+
+### 1.3 已确认决策
+
+| # | 决策点 | 结论 |
+|---|--------|------|
+| 1 | 运行形态 | Node.js 库 + 独立 CLI |
+| 2 | 隧道协议 | 单条持久 WS + 自定义多路复用帧协议 |
+| 3 | authorization 语义 | Express 中间件风格 `(req, res, next)` |
+| 4 | 客户端↔网关认证 | 隧道连接本身无认证（公网部署需自行加前置保护）；token 是用户级凭证，非隧道接入凭证——**但 token 会随转发请求（Bearer 注入）流经隧道，公网部署务必 `wss://` 或前置加密** |
+| 5 | 转发保真度 | 全双工流式：HTTP 体流式转发（支持 SSE/大文件），WS 文本+二进制透传 |
+| 6 | CLI 配置 | JS 配置文件（`export default {…}`） |
+| 7 | 帧编码 | 混合帧：控制帧 JSON 文本 + 数据帧二进制 `[头长][JSON 头][原始负载]` |
+| 8 | 多客户端 | 多台电脑各跑一个 Client 实例同时连网关；路由由服务端按 cookie uuid → hostname → 隧道完成（选择页流程见服务端设计文档 §6） |
+| 9 | token 校验位置 | 客户端是唯一鉴权权威：服务端选择页收到的 token 经隧道探测请求（`/__gateway__/auth-check`）由本包 authorization 链校验；**配置 token 不出客户端进程** |
+
+## 2. 包结构
+
+```text
+packages/client/
+├── package.json        # gateway-client，ESM（"type": "module"），TS 源码直出
+├── tsconfig.json
+├── eslint.config.ts    # 共享根 eslint.shared.ts
+├── vitest.config.ts
+└── src/
+    ├── index.ts        # 导出 Client 类与公共类型
+    ├── client.ts       # Client 主类：装配各模块、生命周期
+    ├── connection.ts   # 网关 WS 连接管理：重连/心跳/通道表路由
+    ├── protocol.ts     # 帧协议编解码（客户端侧实现）
+    ├── http-channel.ts # HTTP 通道：隧道帧 ↔ upstream http/https 流
+    ├── ws-channel.ts   # WS 通道：隧道帧 ↔ upstream ws 连接
+    ├── authorize.ts    # authorization 执行器（Express 风格适配层）
+    ├── cli.ts          # CLI 入口（bin: harness-client）
+    └── logger.ts       # 统一日志
+```
+
+约定：遵循 monorepo 现有规范——ESM、TS 源码直出无构建步骤、vitest、`tsc --noEmit` 类型检查。运行时依赖只用 `ws`（HTTP 请求用 Node 原生 `http`/`https` 模块）。
+
+## 3. 公开 API
+
+```ts
+import { Client } from 'gateway-client'
+
+const client = new Client({
+  upstreamUrl: 'https://localhost:3080',  // 应用服务地址
+  gatewayUrl: 'ws://server:3081/tunnel',  // 网关隧道端点
+  hostname: 'pc-a',                       // 必填：选择页展示名与路由标识（全网关内唯一）
+  token: 'secret-token',                  // 可选：本机接入令牌（见 §3.1 默认鉴权）
+  defaultPath: '/',                       // 可选：用户选择成功后浏览器跳转路径（默认 '/'）
+  authorization: (req, res, next) => {    // 可选；Express 中间件风格
+    // 注意：选择页探测（/__gateway__/auth-check）也走此钩子，自定义钩子必须兼容
+    if (req.headers.cookie?.includes('session=')) return next()
+    res.writeHead(403).end('forbidden')
+  },
+  // 以下为可选字段，均有默认值：
+  // reconnect: { baseDelayMs: 1000, maxDelayMs: 30000, maxRetries: Infinity }
+  // heartbeatIntervalMs: 30000
+  // authTimeoutMs: 30000
+  // connectTimeoutMs: 60000
+  // logger: Logger
+})
+
+await client.connect()  // 建立隧道（内部含自动重连循环）
+await client.close()    // 优雅关闭
+```
+
+### 3.1 authorization 执行语义
+
+Express 中间件风格在隧道场景的精确适配：
+
+- `req`：只读请求信息对象 `{ method, url, headers, ip, isWebSocket }`；HTTP 请求与 WS 握手共用同一钩子。`ip` 为**浏览器真实 IP**（取服务端注入的 `X-Forwarded-For` 首项，缺省为 `null`；不是隧道对端地址）
+- **放行**：调用 `next()`
+- **拒绝**：直接写 `res`（`writeHead` + `end`），该响应原样透传回用户浏览器；或调用 `next(err)` → 默认 403
+- **悬挂兜底**：钩子既不调 `next` 也不写 `res`，超过 `authTimeoutMs`（默认 30s）按拒绝处理，防止悬挂通道堆积
+- **默认鉴权（第二轮修订）**：配置了 `token` 且未提供 `authorization` → 内置校验 `Authorization: Bearer === token`，不符回 403；`token` 与钩子都未配置 → 全部放行（"预留"语义）；自定义钩子优先于默认校验（钩子内可自行读 `req.headers.authorization` 再校验）
+- **保留路径短路**：隧道 HTTP 通道 `path === '/__gateway__/auth-check'`（服务端选择页的 token 探测）照常走 authorization 链；放行则直接回 204 **不打 upstream**，拒绝则回钩子响应
+- WS 只在握手时鉴权一次；握手成功后的消息体不再逐条鉴权
+
+### 3.2 生命周期
+
+- `connect()`：发起连接，首次隧道就绪（收到 `hello.ack`）后 resolve。失败按 §6 重连循环继续、不 reject；超过 `connectTimeoutMs`（默认 60s）仍未就绪则 reject。收到 4409（hostname 冲突）立即 reject 且**不再重连**
+- `close()`：停心跳与重连 → 拒收新 open 帧 → **关闭隧道 WS**（服务端随即注销 hostname，后续请求 502）→ 中止在途通道并释放资源（可配超时强制关闭）
+- 事件：`client.on('connected' | 'disconnected' | 'error', …)`；**必须挂 `error` 监听**（EventEmitter 语义：无监听时 error 事件会抛异常）
+
+## 4. 隧道帧协议（v1）
+
+单条持久 WS 上多路复用，通道以 `channelId`（网关侧生成）标识。
+
+### 4.1 控制帧（JSON 文本帧）
+
+| 方向 | type | 载荷 | 用途 |
+|------|------|------|------|
+| 客户端→网关 | `hello` | `{client:{hostname, defaultPath}}` | 连接建立后首帧发送（**不含 token**）；收到 `hello.ack` 才算隧道就绪 |
+| 网关→客户端 | `hello.ack` | `{}` | 隧道就绪确认；hostname 冲突时改为 WS 关闭码 4409（客户端视为进程级错误：connect() reject、**不重连**） |
+| 网关→客户端 | `http.open` | `{channelId, method, url, headers}` | 新 HTTP 请求；headers 含服务端注入的 `X-Forwarded-For`（浏览器真实 IP） |
+| 网关→客户端 | `ws.open` | `{channelId, url, headers, protocols}` | 新 WS 握手；headers 同样含 `X-Forwarded-For` |
+| 双向 | `channel.close` | `{channelId, code?, reason?}` | 网关→客户端：对端关闭/取消；客户端→网关：upstream 主动关闭/中止 |
+| 客户端→网关 | `http.head` | `{channelId, status, headers}` | HTTP 响应头（含鉴权拒绝响应） |
+| 客户端→网关 | `ws.accept` | `{channelId, protocol?}` | WS 握手成功 |
+| 客户端→网关 | `ws.reject` | `{channelId, status, headers?, body?}` | WS 握手被拒（鉴权拒绝 / upstream 失败）；`body` 仅支持文本（控制帧为 JSON，无二进制体） |
+| 双向 | `channel.error` | `{channelId, message}` | 通道级异常 |
+| 双向 | `ping` / `pong` | `{}` | 应用层心跳 |
+
+**headers 编码约定**：所有帧内的 `headers` 为 JSON 对象，值为 `string | string[]`——多值头（如 `Set-Cookie`）必须用数组表达，接收方按 Node `http` 的约定展开/合并，禁止丢失重复头。
+
+### 4.2 数据帧（二进制）
+
+单条二进制 WS 消息：`[u32 头长（大端）][JSON 头 {channelId, kind, dataType?}][原始负载]`
+
+- `kind: 'http.body' | 'http.body.end' | 'ws.message'`
+- `dataType: 'text' | 'binary'`，仅 `ws.message` 使用，保证 WS 消息类型保真
+- HTTP 请求体/响应体均以 `http.body` 分块流式传输，`http.body.end` 收尾
+- **空体规则**：无论有无 body，发送方都必须以 `http.body.end` 收尾（GET 等无体请求为唯一一帧，负载为空）；接收方凭此帧结束对应流，未收到前不得结束
+
+### 4.3 已知边界（v1 明确不做）
+
+- **逐通道背压**：多路复用共享一条 TCP 流，v1 只尊重整体 WS 连接的 `bufferedAmount`；单通道洪峰会挤占其他通道
+- **通道迁移**：重连后在途通道不可迁移（见 §6）
+- **逐消息鉴权**：WS 握手后的消息不鉴权（见 §3.1）
+
+## 5. 转发流程
+
+### 5.1 HTTP 通道
+
+```text
+网关 http.open ──► authorization 钩子 ──拒绝──► http.head(自定义状态) + body 帧 + 结束帧，通道关闭
+                       │放行
+                       ▼
+              向 upstreamUrl 发起 http/https.request
+              （Host 头重写为 upstream 主机；剥离 hop-by-hop 头，其余透传）
+                       │
+        网关 http.body 数据帧 ──► 逐块写入 request 流（流式，不缓冲）
+                       │
+        upstream 响应头 ──► http.head(status, headers) 回网关
+        upstream 响应体 ──► 分块 http.body 数据帧，流尽发 http.body.end
+                       │
+              upstream 不可达/超时 ──► http.head(502) + 错误说明 + 结束
+```
+
+已确认细节：**Host 头重写为 upstream 主机**（不透传浏览器原始 Host）；**Origin 头同步重写为 upstream origin**（2026-08-23 线上事故补记：浏览器 Origin 描述的是浏览器↔网关的关系，原样透传会被上游同源/反 DNS 重绑定围栏以 Origin.host ≠ Host.host 拒绝——DSH `/api/*` 一律 403；浏览器未携带 Origin 时不伪造。WS 握手浏览器同样携带 Origin，ws 通道同一规则）。
+
+### 5.2 WS 通道
+
+```text
+网关 ws.open ──► authorization 钩子 ──拒绝──► ws.reject{status, body}（HTTP 状态原样回浏览器）
+                    │放行
+                    ▼
+          向 upstream 建立 ws 连接
+          （upstreamUrl 的 http(s) 自动推导为 ws(s)；子协议与非 hop-by-hop 头透传）
+                    │
+        成功 ──► ws.accept{protocol?}，进入双向透传：
+                 （回选的 protocol 必须属于 ws.open.protocols 之一，服务端校验不符即断通道）
+                 网关 ws.message 数据帧 ◄──► upstream ws 消息（text/binary 类型保真）
+        失败 ──► ws.reject{502}
+                    │
+        任一侧关闭 ──► 透传关闭码/原因，对侧执行同样关闭，通道清理
+```
+
+## 6. 连接管理（connection.ts）
+
+- **自动重连**：指数退避 1s → 30s 封顶 + 随机抖动，默认无限重试（`reconnect.maxRetries` 可配）
+- **重连语义**：重连成功是全新会话，旧 `channelId` 全部作废；在途通道本地失败销毁——**502 由服务端在隧道断开时统一回给浏览器，客户端无需也无法补发**。**通道不可迁移**（隧道类系统常规取舍，已确认）
+- **心跳**：每 30s 发应用层 `ping` 控制帧；连续 3 个周期（90s）无任何入站消息判定死连接，主动断开走重连
+- **优雅关闭**（`close()`）：停心跳、拒收新 open 帧、关闭隧道 WS、中止在途通道（可配超时强制关闭）——服务端在隧道关闭时即注销 hostname，不存在"排空间隙继续路由"的竞态
+
+## 7. 错误处理分级
+
+| 级别 | 场景 | 行为 |
+|------|------|------|
+| 通道级 | upstream 不可达、单通道异常 | 只影响该通道：HTTP 回 502 / WS 断开 |
+| 连接级 | 协议错误（坏帧/未知 type）、心跳超时 | ERROR 日志 + 断开重连 |
+| 进程级 | 配置非法、connect 超时、4409 hostname 冲突 | 抛错给调用方；CLI 退出码 1 |
+
+## 8. 日志
+
+遵循仓库日志级别约定：
+
+- INFO：隧道连接状态变更（connected/disconnected/reconnecting）、请求入口（含 channelId）
+- DEBUG：帧级流转、分支走向
+- ERROR：异常捕获，必须带堆栈与业务上下文（channelId、upstream 地址）
+- WARN：重试、超时、降级
+
+## 9. 测试计划（vitest）
+
+- **单测**：帧协议编解码（含二进制帧往返、多值 headers 数组编解码、空体 `http.body.end` 收尾）；authorization 执行器四条路径（放行 / 写 res 拒绝 / next(err) / 悬挂超时）
+- **集成测试**：起真实 upstream http server + ws server + 内存模拟网关，跑通 HTTP GET/POST 大 body、SSE 流式响应、WS echo（text+binary）、鉴权拒绝链路、多 Set-Cookie 透传
+- **auth-check 链路**：探测放行回 204 且**不打 upstream**；探测被钩子拒绝回钩子自定义响应；默认 Bearer 校验的放行/拒绝
+- **重连测试**：kill 模拟网关 → 断言在途通道失败（HTTP 502 / WS 断开）→ 重启 → 断言自动重连恢复；**4409 冲突 → connect() reject 且不重连**
+
+## 10. CLI
+
+```bash
+harness-client --config ./client.config.mjs
+```
+
+- 配置文件的 `export default` 对象直接传给 `new Client()`，与库 API 完全一致
+- bin 名 `harness-client` 与产品名 harness-gateway 对齐（包名 `gateway-client` 沿用 monorepo scope），属刻意
+- 加载配置失败 / 配置非法：打印错误，退出码 1
+- SIGINT/SIGTERM：触发 `close()` 优雅退出
+
+## 11. 非目标（本期不做）
+
+- 隧道连接认证（mTLS 等）——已明确选择无认证
+- 逐通道背压与流控
+- WS 消息级鉴权
+- 多 upstream 路由（单 Client 实例只代理一个 upstreamUrl）

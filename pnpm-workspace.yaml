@@ -1,0 +1,11 @@
+packages:
+  - packages/*
+  - components/**
+  - '!**/test/**'
+
+onlyBuiltDependencies:
+  - '@parcel/watcher'
+  - core-js
+  - electron
+  - esbuild
+  - oxc-resolver
