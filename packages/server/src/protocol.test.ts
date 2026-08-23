@@ -5,8 +5,9 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  type ControlFrame, decodeControl, decodeData, encodeControl,
-  encodeData, normalizeHeaders, ProtocolError, stripHopByHop,
+  type ControlFrame, type DataHeader, decodeControl, decodeData, encodeControl,
+  encodeData, exceedsMaxDataFrame, MAX_PAYLOAD_BYTES, normalizeHeaders,
+  PayloadTooLargeError, ProtocolError, stripHopByHop,
 } from './protocol';
 
 describe('控制帧编解码', () => {
@@ -88,6 +89,33 @@ describe('数据帧编解码', () => {
     buf.writeUInt32BE(head.length, 0);
     head.copy(buf, 4);
     expect(() => decodeData(buf)).toThrow(ProtocolError);
+  });
+});
+
+describe('数据帧尺寸上限（线上丢帧根因修复）', () => {
+  // 边界带：WS 消息过了端点 maxPayload（100MiB），但隧道帧加头后超 100MiB 会杀整条隧道
+  const header: DataHeader = { channelId: 1, kind: 'ws.message', dataType: 'binary' };
+  const headLen = Buffer.byteLength(JSON.stringify(header), 'utf8');
+  /** 复用同一块内存构造不同总长负载，避免多次百 MB 分配 */
+  const arena = Buffer.alloc(MAX_PAYLOAD_BYTES + 8);
+  const payloadForTotal = (total: number): Buffer => arena.subarray(0, total - 4 - headLen);
+
+  it('帧总长恰在上限：exceedsMaxDataFrame = false，encodeData 正常编码', () => {
+    const payload = payloadForTotal(MAX_PAYLOAD_BYTES);
+    expect(exceedsMaxDataFrame(header, payload)).toBe(false);
+    const { payload: out } = decodeData(encodeData(header, payload));
+    expect(out.length).toBe(payload.length);
+  });
+
+  it('帧总长超上限 1 字节：exceedsMaxDataFrame = true，encodeData 抛 PayloadTooLargeError', () => {
+    const payload = payloadForTotal(MAX_PAYLOAD_BYTES + 1);
+    expect(exceedsMaxDataFrame(header, payload)).toBe(true);
+    expect(() => encodeData(header, payload)).toThrow(PayloadTooLargeError);
+  });
+
+  it('普通小帧不受限', () => {
+    expect(exceedsMaxDataFrame(header, Buffer.from('x'))).toBe(false);
+    expect(exceedsMaxDataFrame({ channelId: 2, kind: 'http.body.end' }, Buffer.alloc(0))).toBe(false);
   });
 });
 

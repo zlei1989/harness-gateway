@@ -27,7 +27,7 @@ export type ControlFrame =
   | HelloFrame | HelloAckFrame | HttpOpenFrame | WsOpenFrame | ChannelCloseFrame
   | HttpHeadFrame | WsAcceptFrame | WsRejectFrame | ChannelErrorFrame | PingFrame | PongFrame;
 
-/** 协议错误（坏帧、未知 type）：连接级错误，调用方断开重连 */
+/** 协议错误（坏帧、未知 type）：调用方按坏帧预算降级——单帧 WARN + 丢弃，连续超预算才断开重连（spec §7 帧级） */
 export class ProtocolError extends Error {
   constructor(message: string) {
     super(message);
@@ -76,10 +76,33 @@ export interface DataHeader {
 
 const DATA_KINDS = new Set<string>(['http.body', 'http.body.end', 'ws.message']);
 
-/** 编码数据帧：[u32be 头长][JSON 头][payload] */
+/**
+ * 隧道帧总长上限（线上丢帧根因修复）：与四处 ws 端点 maxPayload 对齐的显式契约
+ * （原为 ws 隐式默认 100MiB）。WS 消息过了接收端 maxPayload，但隧道帧加头后
+ * 可能超过对端 maxPayload（"边界带"），对端收帧即按 1009 杀整条隧道、全通道丢帧；
+ * 发送侧必须先以 exceedsMaxDataFrame 判定，超限按通道级失败处理，不得入隧道。
+ */
+export const MAX_PAYLOAD_BYTES = 100 * 1024 * 1024;
+
+/** 数据帧超尺寸错误：encodeData 兜底防线（正常路径应先经 exceedsMaxDataFrame 显式判定） */
+export class PayloadTooLargeError extends Error {
+  constructor(public readonly size: number) {
+    super(`数据帧超尺寸上限: ${size} > ${MAX_PAYLOAD_BYTES}`);
+    this.name = 'PayloadTooLargeError';
+  }
+}
+
+/** 判定编码后隧道帧总长是否超限（4 字节头长 + JSON 头 UTF-8 长 + 负载长） */
+export function exceedsMaxDataFrame(header: DataHeader, payload: Buffer): boolean {
+  return 4 + Buffer.byteLength(JSON.stringify(header), 'utf8') + payload.length > MAX_PAYLOAD_BYTES;
+}
+
+/** 编码数据帧：[u32be 头长][JSON 头][payload]；帧总长超 MAX_PAYLOAD_BYTES 抛 PayloadTooLargeError */
 export function encodeData(header: DataHeader, payload: Buffer): Buffer {
   const head = Buffer.from(JSON.stringify(header), 'utf8');
-  const out = Buffer.allocUnsafe(4 + head.length + payload.length);
+  const total = 4 + head.length + payload.length;
+  if (total > MAX_PAYLOAD_BYTES) throw new PayloadTooLargeError(total);
+  const out = Buffer.allocUnsafe(total);
   out.writeUInt32BE(head.length, 0);
   head.copy(out, 4);
   payload.copy(out, 4 + head.length);

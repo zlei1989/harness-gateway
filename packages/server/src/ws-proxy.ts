@@ -9,7 +9,7 @@
 import { STATUS_CODES } from 'node:http';
 
 import { type BrowserSessionStore, readSessionCookie, stripSessionCookie } from './browser-session';
-import { type ControlFrame, type DataHeader, type HeadersJson, normalizeHeaders, stripHopByHop } from './protocol';
+import { type ControlFrame, type DataHeader, exceedsMaxDataFrame, type HeadersJson, normalizeHeaders, stripHopByHop } from './protocol';
 import { safePathname } from './url';
 
 import type { Logger } from './logger';
@@ -210,7 +210,19 @@ export function handleBrowserWs(
     ws.on('message', (data, isBinary) => {
       if (finished) return;
       const payload = Buffer.isBuffer(data) ? data : Buffer.from(data as ArrayBuffer);
-      if (!tunnel.sendData({ channelId, kind: 'ws.message', dataType: isBinary ? 'binary' : 'text' }, payload)) {
+      const header: DataHeader = { channelId, kind: 'ws.message', dataType: isBinary ? 'binary' : 'text' };
+      // 边界带护栏（线上丢帧根因修复）：消息过了 browserWss 的 maxPayload（100MiB），
+      // 但隧道帧加 ≈60B 头后可能超对端 100MiB，对端收帧即杀整条隧道（全通道丢帧）；
+      // 超限按通道级失败（spec §7 通道级）：本通道 1009 关闭，隧道与其他通道无感
+      if (exceedsMaxDataFrame(header, payload)) {
+        ctx.logger.warn('WS 消息超隧道帧上限，通道级关闭', { channelId, bytes: payload.length });
+        finish(() => {
+          tunnel.sendControl({ type: 'channel.close', channelId, reason: 'message too large' });
+          ws.close(1009, 'message too large');
+        });
+        return;
+      }
+      if (!tunnel.sendData(header, payload)) {
         ws.pause();
         void tunnel.waitDrain().then(() => ws.resume());
       }

@@ -8,7 +8,10 @@
 import WebSocket from 'ws';
 
 import { type AuthDecision, type AuthRequest, buildAuthRequest } from './authorize';
-import { type ChannelCloseFrame, normalizeHeaders, stripHopByHop, type WsOpenFrame } from './protocol';
+import {
+  type ChannelCloseFrame, type DataHeader, exceedsMaxDataFrame, MAX_PAYLOAD_BYTES,
+  normalizeHeaders, stripHopByHop, type WsOpenFrame,
+} from './protocol';
 
 import type { Connection } from './connection';
 import type { Logger } from './logger';
@@ -80,7 +83,9 @@ export class WsChannel {
     // sec-websocket-protocol 由构造参数 open.protocols 统一协商；透传浏览器侧原值会与参数重复/冲突
     delete headers['sec-websocket-protocol'];
 
-    const ws = new WebSocket(target, open.protocols, { headers });
+    // maxPayload 显式对齐隧道帧上限契约（原为 ws 隐式默认 100MiB）：
+    // 超 100MiB 的消息由本端 1009 杀本通道（通道级），边界带由下方发送护栏拦截
+    const ws = new WebSocket(target, open.protocols, { headers, maxPayload: MAX_PAYLOAD_BYTES });
     this.upstream = ws;
 
     ws.on('open', () => {
@@ -95,12 +100,23 @@ export class WsChannel {
 
     ws.on('message', (data: WebSocket.RawData, isBinary: boolean) => {
       if (this.finished) return;
+      const payload = toBuffer(data);
+      const header: DataHeader = { channelId: this.params.id, kind: 'ws.message', dataType: isBinary ? 'binary' : 'text' };
+      // 边界带护栏（线上丢帧根因修复，与服务端 ws-proxy 对称）：消息过了本端 maxPayload，
+      // 但隧道帧加 ≈60B 头后可能超服务端 100MiB，服务端收帧即以 1009 杀整条隧道（全通道丢帧）；
+      // 超限按通道级失败（spec §7 通道级）：upstream 与本通道关闭，隧道与其他通道无感
+      if (exceedsMaxDataFrame(header, payload)) {
+        this.params.logger.warn('WS 消息超隧道帧上限，通道级关闭', { channelId: this.params.id, bytes: payload.length });
+        this.trySend(() => connection.sendControl({
+          type: 'channel.close', channelId: this.params.id, reason: 'message too large',
+        }));
+        ws.close(1009, 'message too large');
+        this.done();
+        return;
+      }
       let ok = true;
       if (!this.trySend(() => {
-        ok = connection.sendData(
-          { channelId: this.params.id, kind: 'ws.message', dataType: isBinary ? 'binary' : 'text' },
-          toBuffer(data),
-        );
+        ok = connection.sendData(header, payload);
       })) return;
       if (!ok) {
         ws.pause();

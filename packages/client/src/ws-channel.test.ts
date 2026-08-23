@@ -250,6 +250,37 @@ describe('WsChannel', () => {
     expect(done).toBe(1); // 通道中止
   });
 
+  it('边界带 upstream 消息（过 maxPayload 但隧道帧超限）→ 通道级关闭：消息不入隧道，upstream 收 1009，channel.close 回网关', async () => {
+    // 线上丢帧根因回归：100MiB-32 的消息过了客户端 upstream ws 的 maxPayload（100MiB），
+    // 但隧道帧加 ≈60B 头后超 100MiB，服务端收帧即以 1009 杀整条隧道（全通道丢帧）；
+    // 期望发送侧护栏把超限降级为通道级失败：本通道关闭，隧道无感
+    const up = await startUpstreamEcho();
+    cleanup = up.wss;
+    const conn = new FakeConnection();
+    let done = 0;
+    const ch = new WsChannel({
+      id: 1, open: makeOpen({ protocols: [] }), upstream: up.url,
+      connection: conn.asConnection(), authorize: ALLOW, logger: nullLogger,
+      onDone: () => { done += 1; },
+    });
+    await ch.start();
+    await new Promise((r) => setTimeout(r, 50)); // 等 accept 完成
+    const upstreamWs = [...up.wss.clients][0]!;
+    upstreamWs.send(Buffer.alloc(100 * 1024 * 1024 - 32));
+    // 大消息接收 + 关闭握手需要时间，轮询等通道收尾（防固定 sleep 抖动）
+    const deadline = Date.now() + 20000;
+    while (up.closes.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    // RED 判据：超尺寸消息不得进入隧道（修复前 FakeConnection 会收到它）
+    expect(conn.data.length).toBe(0);
+    expect(conn.controls.find((f) => f.type === 'channel.close'))
+      .toMatchObject({ type: 'channel.close', channelId: 1, reason: 'message too large' });
+    expect(done).toBe(1);
+    expect(up.closes[0]?.code).toBe(1009);
+    expect(up.closes[0]?.reason.toString()).toBe('message too large');
+  }, 30000);
+
   it('onPeerClose 非法 close code（1005）：替换为 1000 透传，不抛 RangeError', async () => {
     const up = await startUpstreamEcho();
     cleanup = up.wss;

@@ -134,6 +134,8 @@ export class HttpChannel {
     this.headSent = true;
     res.on('data', (chunk: Buffer) => {
       if (this.finished) return;
+      // 无需 exceedsMaxDataFrame 护栏：chunk 来自 Node 流读取（≪100MiB），数学上不可能超隧道帧上限；
+      // encodeData 的 PayloadTooLargeError 兜底由 trySend 消化为通道级中止（护栏在 ws-channel 的 WS 消息路径）
       let ok = true;
       if (!this.trySend(() => { ok = connection.sendData({ channelId: this.params.id, kind: 'http.body' }, chunk); })) return;
       if (!ok) {

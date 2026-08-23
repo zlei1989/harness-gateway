@@ -286,23 +286,115 @@ describe('Connection', () => {
     await gw.close();
   });
 
-  it('坏控制帧仍是隧道级协议错误（1002 关闭），且 ERROR 日志不回显帧原文（token 红线）', async () => {
+  it('坏控制帧降级为丢帧：WARN、隧道存活、后续帧正常路由、日志不回显帧原文（token 红线）', async () => {
     const gw = new MockGateway();
+    const warns: string[] = [];
     const errors: string[] = [];
-    const logger = { ...nullLogger, error: (m: string, c?: Record<string, unknown>) => { errors.push(m + ' ' + JSON.stringify(c)); } };
+    const capture = (m: string, c?: Record<string, unknown>) => m + ' ' + JSON.stringify(c);
+    const logger = {
+      ...nullLogger,
+      warn: (m: string, c?: Record<string, unknown>) => { warns.push(capture(m, c)); },
+      error: (m: string, c?: Record<string, unknown>) => { errors.push(capture(m, c)); },
+    };
+    const { handlers, calls } = makeHandlers();
+    // 心跳拉长到 10s：测试窗口内无 ping/pong 干扰坏帧计数断言
+    const conn = new Connection(
+      { gatewayUrl: gw.url, ...OPTS, heartbeatIntervalMs: 10_000, logger }, handlers,
+    );
+    conn.on('error', () => {});
+    await conn.connect();
+    let closeCode: number | null = null;
+    gw.sockets[0]?.on('close', (code) => { closeCode = code; });
+    // 模拟含 token 的坏帧（JSON 非法）：http.open 帧可携带 authorization 头
+    gw.sockets[0]?.send('{"type":"http.open","headers":{"authorization":"Bearer secret-token-xyz"}},broken');
+    await new Promise((r) => setTimeout(r, 300)); // 窗口远超回环 close 握手耗时
+    expect(closeCode).toBeNull(); // 隧道未收到任何关闭
+    expect(calls.disconnected).toBe(0);
+    expect(warns.length).toBeGreaterThan(0); // 单帧降级为 WARN
+    expect(errors).toHaveLength(0); // 单帧不升级 ERROR
+    // 日志（含上下文）不得回显帧原文（token 红线，ProtocolError 契约保证）
+    expect(warns.join('\n') + errors.join('\n')).not.toContain('secret-token-xyz');
+    // 后续帧仍正常路由（隧道功能完好）
+    gw.sockets[0]?.send(encodeControl({ type: 'channel.error', channelId: 1, message: 'x' }));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(calls.control.some((f) => f.type === 'channel.error')).toBe(true);
+    await conn.close();
+    await gw.close();
+  });
+
+  it('坏二进制数据帧同样降级为丢帧，隧道存活且后续数据帧正常路由', async () => {
+    const gw = new MockGateway();
+    const { handlers, calls } = makeHandlers();
+    const conn = new Connection(
+      { gatewayUrl: gw.url, ...OPTS, heartbeatIntervalMs: 10_000 }, handlers,
+    );
+    conn.on('error', () => {});
+    await conn.connect();
+    let closeCode: number | null = null;
+    gw.sockets[0]?.on('close', (code) => { closeCode = code; });
+    // 头长越界的坏数据帧（声明 1024 字节头，实际无负载）
+    const bad = Buffer.alloc(4);
+    bad.writeUInt32BE(1024, 0);
+    gw.sockets[0]?.send(bad);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(closeCode).toBeNull();
+    expect(calls.disconnected).toBe(0);
+    // 后续数据帧正常路由
+    gw.sockets[0]?.send(encodeData({ channelId: 7, kind: 'ws.message' }, Buffer.from('ok')));
+    await new Promise((r) => setTimeout(r, 50));
+    expect(calls.data.some((h) => h.channelId === 7)).toBe(true);
+    await conn.close();
+    await gw.close();
+  });
+
+  it('连续坏帧达预算（5）升级为隧道级协议错误：前 4 帧 WARN，第 5 帧 ERROR + 1002 断开，升级后后续坏帧静默', async () => {
+    const gw = new MockGateway();
+    const warns: string[] = [];
+    const errors: string[] = [];
+    const logger = {
+      ...nullLogger,
+      warn: (m: string) => { warns.push(m); },
+      error: (m: string) => { errors.push(m); },
+    };
     const { handlers } = makeHandlers();
-    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS, logger }, handlers);
+    const conn = new Connection(
+      { gatewayUrl: gw.url, ...OPTS, heartbeatIntervalMs: 10_000, logger }, handlers,
+    );
     conn.on('error', () => {});
     await conn.connect();
     let closeCode = 0;
     gw.sockets[0]?.on('close', (code) => { closeCode = code; });
     const disconnected = new Promise<void>((resolve) => conn.once('disconnected', resolve));
-    // 模拟含 token 的坏帧（JSON 非法）：http.open 帧可携带 authorization 头
-    gw.sockets[0]?.send('{"type":"http.open","headers":{"authorization":"Bearer secret-token-xyz"}},broken');
+    // 7 帧：第 5 帧升级后，close 握手窗口内到达的第 6/7 帧不得再放大 ERROR 日志
+    for (let i = 0; i < 7; i++) gw.sockets[0]?.send(`bad-frame-${i}`);
     await disconnected;
     // 客户端先感知 close，网关侧 close 事件略晚到达，用 waitFor 消除时序窗口
-    await vi.waitFor(() => { expect(closeCode).toBe(1002); }); // 协议错误路径不变
-    expect(errors.join('\n')).not.toContain('secret-token-xyz'); // 日志（含堆栈）不得回显帧原文
+    await vi.waitFor(() => { expect(closeCode).toBe(1002); });
+    expect(warns.filter((m) => m.includes('坏帧'))).toHaveLength(4); // 预算内逐帧 WARN（断连诊断 WARN 不算）
+    expect(errors).toHaveLength(1); // 仅升级瞬间一条 ERROR（latch 防日志洪泛）
+    await conn.close();
+    await gw.close();
+  });
+
+  it('成功解码的帧重置连续坏帧计数：间歇坏帧（4 坏 + 1 好 + 4 坏）不升级', async () => {
+    const gw = new MockGateway();
+    const { handlers, calls } = makeHandlers();
+    const conn = new Connection(
+      { gatewayUrl: gw.url, ...OPTS, heartbeatIntervalMs: 10_000 }, handlers,
+    );
+    conn.on('error', () => {});
+    await conn.connect();
+    let closeCode: number | null = null;
+    gw.sockets[0]?.on('close', (code) => { closeCode = code; });
+    const sock = gw.sockets[0];
+    // 若无重置，两批累计 8 帧早已超预算（5）；中间的好帧必须清零计数
+    for (let i = 0; i < 4; i++) sock?.send(`bad-${i}`);
+    sock?.send(encodeControl({ type: 'channel.error', channelId: 1, message: 'x' }));
+    for (let i = 0; i < 4; i++) sock?.send(`bad2-${i}`);
+    await new Promise((r) => setTimeout(r, 300));
+    expect(closeCode).toBeNull();
+    expect(calls.disconnected).toBe(0);
+    expect(calls.control.some((f) => f.type === 'channel.error')).toBe(true); // 好帧已路由
     await conn.close();
     await gw.close();
   });

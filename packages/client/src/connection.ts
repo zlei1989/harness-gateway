@@ -11,7 +11,7 @@ import WebSocket from 'ws';
 
 import {
   type ControlFrame, type DataHeader, decodeControl, decodeData,
-  encodeControl, encodeData,
+  encodeControl, encodeData, MAX_PAYLOAD_BYTES,
 } from './protocol';
 
 import type { Logger } from './logger';
@@ -47,6 +47,8 @@ const DRAIN_POLL_MS = 100;
 const CLOSE_FORCE_MS = 5000;
 /** 心跳判死：连续 N 个心跳周期无任何入站消息判定死连接（默认 30s 周期 × 3 = 90s，容忍链路瞬时 stall） */
 const DEAD_AFTER_MISSED_HEARTBEATS = 3;
+/** 坏帧降级预算（spec §7 帧级）：连续 N 帧解码失败才升级为隧道级协议错误断开 */
+const MAX_CONSECUTIVE_BAD_FRAMES = 5;
 
 /** ws RawData 统一转 Buffer（Buffer/ArrayBuffer/Buffer[] 三态） */
 function toBuffer(data: WebSocket.RawData): Buffer {
@@ -63,6 +65,10 @@ export class Connection extends EventEmitter {
   private lastActivityAt = 0;
   /** 最近一次 hello.ack 就绪时刻（0 = 未就绪），断开诊断日志的 readyMs 基准 */
   private readyAt = 0;
+  /** 连续坏帧计数：成功解码任意帧即清零；新连接尝试从零开始 */
+  private consecutiveBadFrames = 0;
+  /** 坏帧升级 latch：升级为隧道级断开后，close 握手窗内到达的坏帧静默丢弃（防 ERROR 日志洪泛） */
+  private badFrameEscalated = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private drainWaiters: Array<() => void> = [];
@@ -160,8 +166,12 @@ export class Connection extends EventEmitter {
 
   /** 发起一次连接尝试并接线全部事件 */
   private attempt(): void {
-    const ws = new WebSocket(this.opts.gatewayUrl);
+    // maxPayload 显式对齐隧道帧上限契约（原为 ws 隐式默认 100MiB）：
+    // 对端发送护栏保证隧道帧不超限，此处是对协议失配的显式声明
+    const ws = new WebSocket(this.opts.gatewayUrl, { maxPayload: MAX_PAYLOAD_BYTES });
     this.ws = ws;
+    this.consecutiveBadFrames = 0;
+    this.badFrameEscalated = false;
 
     ws.on('open', () => {
       // 过期/关闭守卫：closing 中或已被更新尝试取代的旧 ws，不得再发 hello
@@ -180,9 +190,10 @@ export class Connection extends EventEmitter {
         try {
           decoded = decodeData(toBuffer(data));
         } catch (err) {
-          this.onProtocolError(ws, err);
+          this.onBadFrame(ws, err);
           return;
         }
+        this.consecutiveBadFrames = 0; // 成功解码即重置连续坏帧计数
         this.callChannelHandler(() => this.handlers.onData(decoded.header, decoded.payload));
         return;
       }
@@ -190,9 +201,10 @@ export class Connection extends EventEmitter {
       try {
         frame = decodeControl(toBuffer(data).toString('utf8'));
       } catch (err) {
-        this.onProtocolError(ws, err);
+        this.onBadFrame(ws, err);
         return;
       }
+      this.consecutiveBadFrames = 0;
       this.handleControl(frame);
     });
 
@@ -206,7 +218,32 @@ export class Connection extends EventEmitter {
   }
 
   /**
-   * 协议解析错误（decodeControl/decodeData 抛 ProtocolError）= 隧道级：ERROR 日志 + 1002 断开走重连。
+   * 坏帧降级（帧级，spec §7）：单条畸形帧 WARN + 丢弃，隧道与在途通道不受影响——
+   * 隧道跑在 WS 消息分帧之上，每条 WS 消息就是一个完整隧道帧，坏消息不会造成
+   * 流式协议那种帧边界错位，丢弃是安全的；可归属 channelId 的错误由通道层各自消化。
+   * 连续 MAX_CONSECUTIVE_BAD_FRAMES 帧解码失败 = 系统性损坏/协议版本不匹配，
+   * 升级为隧道级协议错误断开重连，避免双向协议失配时空转挂死；升级后置 latch，
+   * close 握手窗内到达的后续坏帧静默丢弃（防 ERROR 日志洪泛）。
+   * 握手期（hello.ack 前）同样适用本预算——首帧坏帧的兜底仍是超预算后的 1002 + 重连。
+   * 日志安全：ProtocolError 消息只含非内容诊断（protocol.ts 契约保证不回显帧原文）。
+   */
+  private onBadFrame(ws: WebSocket, err: unknown): void {
+    if (this.badFrameEscalated) return;
+    this.consecutiveBadFrames += 1;
+    if (this.consecutiveBadFrames >= MAX_CONSECUTIVE_BAD_FRAMES) {
+      this.badFrameEscalated = true;
+      this.onProtocolError(ws, err);
+      return;
+    }
+    this.opts.logger.warn('坏帧丢弃（隧道保持存活）', {
+      consecutive: this.consecutiveBadFrames,
+      budget: MAX_CONSECUTIVE_BAD_FRAMES,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  /**
+   * 隧道级协议错误（仅连续坏帧超预算时由 onBadFrame 触发）：ERROR 日志 + 1002 断开走重连。
    * 注意：错误消息只含非内容诊断（protocol.ts 保证不回显帧原文），本层只附加堆栈。
    */
   private onProtocolError(ws: WebSocket, err: unknown): void {

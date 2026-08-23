@@ -35,14 +35,14 @@ afterEach(async () => {
   httpServer = null;
 });
 
-async function setup(helloTimeoutMs = 200): Promise<TunnelRegistry> {
+async function setup(helloTimeoutMs = 200, logger: import('./logger').Logger = nullLogger): Promise<TunnelRegistry> {
   const tunnels = new TunnelRegistry();
   httpServer = createServer();
   httpServer.on('connection', (s) => {
     serverSockets.add(s);
     s.on('close', () => serverSockets.delete(s));
   });
-  attachTunnelHandler(httpServer, { tunnels, tunnelPath: '/__gateway__/tunnel', helloTimeoutMs, logger: nullLogger });
+  attachTunnelHandler(httpServer, { tunnels, tunnelPath: '/__gateway__/tunnel', helloTimeoutMs, logger });
   await new Promise<void>((r) => httpServer!.listen(0, '127.0.0.1', r));
   const addr = httpServer.address();
   if (typeof addr === 'string' || !addr) throw new Error('no addr');
@@ -126,5 +126,104 @@ describe('隧道接入', () => {
     });
     // 关键断言：隧道处理器没有接管它（若被误接管，客户端会收到 4408 hello 超时关闭码）
     expect(code).not.toBe(4408);
+  });
+
+  it('已就绪后坏帧降级为丢帧：隧道存活、hostname 在册、后续帧正常路由', async () => {
+    const tunnels = await setup();
+    const ws = connectWs();
+    await new Promise<void>((r) => ws.on('open', r));
+    sendHello(ws, 'pc-a');
+    await new Promise((r) => ws.once('message', r)); // hello.ack
+    // 文本坏帧 + 二进制坏帧（头长越界）各一
+    ws.send('garbage-not-json');
+    const badBin = Buffer.alloc(4);
+    badBin.writeUInt32BE(4096, 0);
+    ws.send(badBin);
+    // 窗口远超回环 close 握手耗时：若被降级前实现关闭，close 事件早已到达
+    const closed = await Promise.race([
+      new Promise<number>((r) => ws.on('close', (c) => r(c))),
+      new Promise<null>((r) => setTimeout(() => r(null), 300)),
+    ]);
+    expect(closed).toBeNull();
+    expect(tunnels.has('pc-a')).toBe(true);
+    // 后续控制帧正常路由：ping → pong
+    ws.send(encodeControl({ type: 'ping' }));
+    const pong = await new Promise<ControlFrame>((r) =>
+      ws.once('message', (d) => r(JSON.parse(String(d)) as ControlFrame)));
+    expect(pong).toEqual({ type: 'pong' });
+    ws.close();
+  });
+
+  it('连续坏帧达预算（5）升级为 1002 断开并注销 hostname：前 4 帧仅 WARN，升级后后续坏帧静默', async () => {
+    const warns: string[] = [];
+    const errors: string[] = [];
+    const logger = {
+      ...nullLogger,
+      warn: (m: string) => { warns.push(m); },
+      error: (m: string) => { errors.push(m); },
+    };
+    const tunnels = await setup(200, logger);
+    const ws = connectWs();
+    await new Promise<void>((r) => ws.on('open', r));
+    sendHello(ws, 'pc-a');
+    await new Promise((r) => ws.once('message', r));
+    // 7 帧：第 5 帧升级后，close 握手窗口内到达的第 6/7 帧不得再放大 ERROR 日志
+    for (let i = 0; i < 7; i++) ws.send(`bad-${i}`);
+    const code = await new Promise<number>((r) => ws.on('close', (c) => r(c)));
+    expect(code).toBe(1002);
+    await new Promise((r) => setTimeout(r, 50)); // 等 close 事件完成注销
+    expect(tunnels.has('pc-a')).toBe(false);
+    expect(warns.filter((m) => m.includes('坏帧'))).toHaveLength(4); // 预算内逐帧 WARN
+    expect(errors).toHaveLength(1); // 仅升级瞬间一条 ERROR（latch 防日志洪泛）
+  });
+
+  it('成功解码的帧重置连续坏帧计数：间歇坏帧（4 坏 + 1 好 + 4 坏）不升级', async () => {
+    const tunnels = await setup();
+    const ws = connectWs();
+    await new Promise<void>((r) => ws.on('open', r));
+    sendHello(ws, 'pc-a');
+    await new Promise((r) => ws.once('message', r));
+    // 若无重置，两批累计 8 帧早已超预算（5）；中间的好帧必须清零计数
+    for (let i = 0; i < 4; i++) ws.send(`bad-${i}`);
+    ws.send(encodeControl({ type: 'ping' }));
+    for (let i = 0; i < 4; i++) ws.send(`bad2-${i}`);
+    const pong = await new Promise<ControlFrame>((r) =>
+      ws.once('message', (d) => r(JSON.parse(String(d)) as ControlFrame)));
+    expect(pong).toEqual({ type: 'pong' }); // 好帧已路由（重置发生在其解码成功时）
+    const closed = await Promise.race([
+      new Promise<number>((r) => ws.on('close', (c) => r(c))),
+      new Promise<null>((r) => setTimeout(() => r(null), 300)),
+    ]);
+    expect(closed).toBeNull();
+    expect(tunnels.has('pc-a')).toBe(true);
+    ws.close();
+  });
+
+  it('路由层异常（非 ProtocolError）消化不关隧道：记 ERROR 后隧道功能完好', async () => {
+    const errors: string[] = [];
+    const logger = { ...nullLogger, error: (m: string) => { errors.push(m); } };
+    const tunnels = await setup(200, logger);
+    const ws = connectWs();
+    await new Promise<void>((r) => ws.on('open', r));
+    sendHello(ws, 'pc-a');
+    await new Promise((r) => ws.once('message', r));
+    // 诱导路由层抛普通 Error（如 pong 回写竞态的同类）：实例级替换 handleControl
+    const session = tunnels.get('pc-a');
+    if (!session) throw new Error('session missing');
+    const original = session.handleControl;
+    Object.assign(session, {
+      handleControl: () => { throw new Error('boom'); },
+    });
+    ws.send(encodeControl({ type: 'ping' }));
+    await new Promise((r) => setTimeout(r, 100));
+    expect(errors.some((m) => m.includes('路由异常'))).toBe(true);
+    // 隧道未被关闭：恢复正常路由后 ping → pong 证明功能完好
+    Object.assign(session, { handleControl: original });
+    ws.send(encodeControl({ type: 'ping' }));
+    const pong = await new Promise<ControlFrame>((r) =>
+      ws.once('message', (d) => r(JSON.parse(String(d)) as ControlFrame)));
+    expect(pong).toEqual({ type: 'pong' });
+    expect(tunnels.has('pc-a')).toBe(true);
+    ws.close();
   });
 });

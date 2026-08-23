@@ -1,8 +1,8 @@
 /**
  * 端到端集成测试 — 真实 WS 隧道 + 真实 upstream 的模拟网关全链路。
  * 覆盖：HTTP 转发（Bearer 注入/流式 SSE/多 Set-Cookie）、auth-check 短路、
- * WS 握手 accept/reject、隧道断开自动重连。
- * 注意：token 只出现在协议帧与断言中，禁止打印日志；消息级 WS 保真由 ws-channel 单测覆盖，此处只测握手层。
+ * WS 握手 accept/reject、并发双 WS 通道消息级互不串扰、隧道断开自动重连。
+ * 注意：token 只出现在协议帧与断言中，禁止打印日志。
  */
 
 import { createServer, type Server } from 'node:http';
@@ -114,6 +114,40 @@ describe('e2e：隧道全链路', () => {
     const client = await makeClient({ upstreamUrl: `http://127.0.0.1:${wsPort}` });
     const opened = await gateway.wsOpen('/socket', { authorization: 'Bearer wrong' });
     expect(opened).toMatchObject({ accepted: false, status: 403 });
+    await client.close();
+  });
+
+  it('并发双 WS 通道：消息交错转发互不串扰（channelId 隔离、类型保真、各自有序）', async () => {
+    const wsPort = (wss.address() as { port: number }).port;
+    const client = await makeClient({ upstreamUrl: `http://127.0.0.1:${wsPort}` });
+    // 同时开两条 WS 通道（复刻浏览器并发场景：同页面多条 WS 同时打向同一 upstream）
+    const [a, b] = await Promise.all([
+      gateway.wsOpen('/socket', { authorization: 'Bearer t1' }),
+      gateway.wsOpen('/socket', { authorization: 'Bearer t1' }),
+    ]);
+    expect(a.accepted).toBe(true);
+    expect(b.accepted).toBe(true);
+    expect(a.channelId).not.toBe(b.channelId); // 通道编号唯一分配
+    // 交错发送：A text → B binary → A binary → B text
+    // 注：交错发生在发送侧（四条消息同步发出后统一收回声），验证 channelId 路由隔离与
+    // 通道内保序；到达侧的飞行中插入竞态由隧道单 WS 字节序天然保证，无需构造
+    gateway.sendWsMessage(a.channelId, 'text', Buffer.from('hello-A'));
+    gateway.sendWsMessage(b.channelId, 'binary', Buffer.from([1, 2, 3]));
+    gateway.sendWsMessage(a.channelId, 'binary', Buffer.from([9, 9]));
+    gateway.sendWsMessage(b.channelId, 'text', Buffer.from('hello-B'));
+    // 每条通道只收到自己的回声，顺序与 text/binary 类型保真
+    const a1 = await gateway.nextWsMessage(a.channelId);
+    const a2 = await gateway.nextWsMessage(a.channelId);
+    const b1 = await gateway.nextWsMessage(b.channelId);
+    const b2 = await gateway.nextWsMessage(b.channelId);
+    expect(a1.dataType).toBe('text');
+    expect(a1.payload.toString()).toBe('hello-A');
+    expect(a2.dataType).toBe('binary');
+    expect(a2.payload.equals(Buffer.from([9, 9]))).toBe(true);
+    expect(b1.dataType).toBe('binary');
+    expect(b1.payload.equals(Buffer.from([1, 2, 3]))).toBe(true);
+    expect(b2.dataType).toBe('text');
+    expect(b2.payload.toString()).toBe('hello-B');
     await client.close();
   });
 

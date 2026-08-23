@@ -18,7 +18,7 @@ class FakeTunnel {
   openFrames: Extract<ControlFrame, { type: 'ws.open' }>[] = [];
   messages: { dataType?: string; payload: Buffer }[] = [];
   // brief 缺陷最小修复：channel.close 多数场景只带 reason 不带 code，需同时记录 channelId 才能断言"哪条通道被关"
-  closes: { channelId: number; code?: number }[] = [];
+  closes: { channelId: number; code?: number; reason?: string }[] = [];
   private channels = new Map<number, PendingChannel>();
   register(channel: PendingChannel): number {
     const id = this.channels.size + 1;
@@ -28,7 +28,7 @@ class FakeTunnel {
   unregister(id: number): void { this.channels.delete(id); }
   sendControl(frame: ControlFrame): void {
     if (frame.type === 'ws.open') this.openFrames.push(frame);
-    if (frame.type === 'channel.close') this.closes.push({ channelId: frame.channelId, code: frame.code });
+    if (frame.type === 'channel.close') this.closes.push({ channelId: frame.channelId, code: frame.code, reason: frame.reason });
   }
   sendData(header: DataHeader, payload: Buffer): boolean {
     if (header.kind === 'ws.message') this.messages.push({ dataType: header.dataType, payload });
@@ -322,6 +322,39 @@ describe('handleBrowserWs', () => {
     expect(await status).toBe(504);
     ws.on('error', () => {});
   });
+
+  it('边界带消息（过 browserWss 但隧道帧超限）→ 通道级 1009 关闭，消息不入隧道，同隧道其他通道不受影响', async () => {
+    // 线上丢帧根因回归：100MiB-32 的消息过了 browserWss 默认 maxPayload（100MiB），
+    // 但隧道帧加 ≈60B 头后超 100MiB，客户端收帧即杀整条隧道（全通道丢帧）；
+    // 期望发送侧护栏把超限降级为通道级失败：本通道 1009，隧道与其他通道无感
+    const uuid = await setup();
+    const ws = connectBrowser('/socket', `gateway_sid=${uuid}`);
+    await waitFor(() => tunnel.openFrames.length > 0);
+    const channelId = tunnel.openFrames[0]?.channelId ?? 0;
+    tunnel.accept(channelId);
+    await new Promise<void>((r) => ws.on('open', r));
+
+    const closed = new Promise<{ code: number; reason: Buffer }>((r) =>
+      ws.on('close', (code, reason) => r({ code, reason })));
+    ws.send(Buffer.alloc(100 * 1024 * 1024 - 32));
+    const { code, reason } = await closed;
+    expect(code).toBe(1009);
+    expect(reason.toString()).toBe('message too large');
+    // RED 判据：超尺寸消息不得进入隧道（修复前 FakeTunnel 会收到它）
+    expect(tunnel.messages.length).toBe(0);
+    expect(tunnel.closes.find((c) => c.channelId === channelId)?.reason).toBe('message too large');
+
+    // 同隧道其他通道不受影响：新浏览器连接正常收发
+    const ws2 = connectBrowser('/socket', `gateway_sid=${uuid}`);
+    await waitFor(() => tunnel.openFrames.length > 1);
+    const id2 = tunnel.openFrames[1]?.channelId ?? 0;
+    tunnel.accept(id2);
+    await new Promise<void>((r) => ws2.on('open', r));
+    ws2.send('still-alive');
+    await waitFor(() => tunnel.messages.length > 0, 5000);
+    expect(tunnel.messages[0]?.payload.toString()).toBe('still-alive');
+    ws2.close();
+  }, 30000);
 
   it('WS 升级入口日志只记 pathname：查询串（常见 token 携带位）不得入日志', async () => {
     const records: { message: string; context?: Record<string, unknown> }[] = [];

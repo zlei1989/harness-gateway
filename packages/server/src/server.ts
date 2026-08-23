@@ -12,6 +12,7 @@ import { BrowserSessionStore } from './browser-session';
 import { createOriginMatcher, DEFAULT_CORS_ORIGINS } from './cors';
 import { handleBrowserHttp, type ProxyContext } from './http-proxy';
 import { createDefaultLogger, type Logger } from './logger';
+import { MAX_PAYLOAD_BYTES } from './protocol';
 import { handleSelectGet, handleSelectPost } from './select-page';
 import { TunnelRegistry } from './session';
 import { attachTunnelHandler } from './tunnel';
@@ -114,10 +115,13 @@ export class GatewayServer {
     });
 
     // 浏览器 WS：handleProtocols 回选改写后的唯一协议（ws-proxy 在 handleUpgrade 前改写请求头）
-    // 挂为实例字段：close() 须 terminate 全部浏览器客户端，否则 upgrade 过的 socket 使关闭悬挂
+    // 挂为实例字段：close() 须 terminate 全部浏览器客户端，否则 upgrade 过的 socket 使关闭悬挂；
+    // maxPayload 显式对齐隧道帧上限契约（原为 ws 隐式默认 100MiB）：
+    // 超 100MiB 的浏览器消息由本端 1009 杀本通道（通道级），边界带由 ws-proxy 发送护栏拦截
     this.browserWss = new WebSocketServer({
       noServer: true,
       handleProtocols: (protocols) => [...protocols][0] ?? false,
+      maxPayload: MAX_PAYLOAD_BYTES,
     });
     const browserWss = this.browserWss;
     this.httpServer.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {

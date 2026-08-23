@@ -2,13 +2,15 @@
  * 隧道接入 — tunnelPath 的 WS upgrade、hello 握手、hostname 唯一性仲裁。
  * 关闭码约定：4409 = hostname 冲突（客户端进程级错误，不重连，无需防互踢）；
  * 4408 = hello 超时；握手后才收 hello，超时前到达的其他帧一律按协议错误断开。
+ * 已就绪后坏帧降级（spec §8 帧级）：单条畸形帧 WARN + 丢弃，连续 5 帧才按隧道级
+ * 协议错误 1002 断开（与客户端 connection.ts 对称，防双向协议失配时空转挂死）。
  * 注意：沿用仓库 ws-gateway.ts 范式——先 handleUpgrade 完成握手，再 close(code) 透传业务关闭码。
  * 安全红线：hello 帧可能携带 token（预留字段），日志不得打印 hello 帧内容（仅记 hostname/错误摘要）。
  */
 
 import { type RawData, type WebSocket, WebSocketServer } from 'ws';
 
-import { decodeControl, decodeData, encodeControl, ProtocolError } from './protocol';
+import { decodeControl, decodeData, encodeControl, MAX_PAYLOAD_BYTES, ProtocolError } from './protocol';
 import { TunnelRegistry, TunnelSession } from './session';
 import { safePathname } from './url';
 
@@ -33,7 +35,9 @@ function toBuffer(data: RawData): Buffer {
 
 /** 把隧道 upgrade 处理器挂到 http.Server（只处理 tunnelPath，其余路径交还其他监听者） */
 export function attachTunnelHandler(server: Server, ctx: TunnelContext): WebSocketServer {
-  const wss = new WebSocketServer({ noServer: true });
+  // maxPayload 显式对齐隧道帧上限契约（原为 ws 隐式默认 100MiB）：
+  // 双端发送护栏保证隧道帧不超限，此处是对协议失配的显式声明
+  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD_BYTES });
 
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     // 畸形 request-target 防线：回调内 new URL 抛错即 uncaughtException 崩进程，销毁 socket 处置
@@ -49,9 +53,16 @@ export function attachTunnelHandler(server: Server, ctx: TunnelContext): WebSock
   return wss;
 }
 
+/** 坏帧降级预算（与客户端 connection.ts 对称）：连续 N 帧解码失败才升级为隧道级协议错误断开 */
+const MAX_CONSECUTIVE_BAD_FRAMES = 5;
+
 /** 隧道连接生命周期：等 hello → 仲裁 → 登记 → 帧路由 → 断开清理 */
 function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
   let session: TunnelSession | null = null;
+  /** 连续坏帧计数：成功解码任意帧即清零（仅就绪后路由阶段使用） */
+  let consecutiveBadFrames = 0;
+  /** 坏帧升级 latch：升级为 1002 后 close 握手窗内到达的坏帧静默丢弃（防 ERROR 日志洪泛） */
+  let badFrameEscalated = false;
 
   // hello 超时：握手后 helloTimeoutMs 内未收到合法 hello
   const helloTimer = setTimeout(() => {
@@ -101,13 +112,38 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
     try {
       if (isBinary) {
         const { header, payload } = decodeData(buf);
+        consecutiveBadFrames = 0; // 成功解码即重置连续坏帧计数
         session.handleData(header, payload);
       } else {
-        session.handleControl(decodeControl(buf.toString('utf8')));
+        const frame = decodeControl(buf.toString('utf8'));
+        consecutiveBadFrames = 0;
+        session.handleControl(frame);
       }
     } catch (err) {
-      ctx.logger.error('隧道协议错误，断开', { hostname: session?.hostname, error: err instanceof Error ? err.stack : String(err) });
-      ws.close(1002, 'protocol error');
+      if (err instanceof ProtocolError) {
+        // 坏帧降级（帧级，spec §8）：单条畸形帧 WARN + 丢弃——隧道跑在 WS 消息分帧之上，
+        // 每条 WS 消息就是一个完整隧道帧，坏消息不会造成帧边界错位，丢弃不影响在途通道；
+        // 连续超预算 = 系统性损坏/协议版本不匹配，才按隧道级协议错误断开；
+        // 升级后置 latch，close 握手窗内到达的后续坏帧静默丢弃（防 ERROR 日志洪泛）。
+        // 日志安全：ProtocolError 消息只含非内容诊断（protocol.ts 契约保证不回显帧原文）。
+        if (badFrameEscalated) return;
+        consecutiveBadFrames += 1;
+        if (consecutiveBadFrames >= MAX_CONSECUTIVE_BAD_FRAMES) {
+          badFrameEscalated = true;
+          ctx.logger.error('隧道协议错误，断开', { hostname: session?.hostname, error: err instanceof Error ? err.stack : String(err) });
+          ws.close(1002, 'protocol error');
+        } else {
+          ctx.logger.warn('坏帧丢弃（隧道保持存活）', {
+            hostname: session?.hostname,
+            consecutive: consecutiveBadFrames,
+            budget: MAX_CONSECUTIVE_BAD_FRAMES,
+            error: err.message,
+          });
+        }
+      } else {
+        // 路由层异常（如 pong 回写时连接正关闭）：消化不关隧道，close 事件随后自清
+        ctx.logger.error('隧道帧路由异常已消化', { hostname: session?.hostname, error: err instanceof Error ? err.stack : String(err) });
+      }
     }
   });
 

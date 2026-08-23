@@ -181,7 +181,9 @@ export function handleBrowserHttp(
   // 日志只记 pathname：查询串是常见 token 携带位，任何级别不得打印完整 req.url（转发帧仍带完整 url）
   ctx.logger.info('请求入口', { channelId, method: req.method, url: safePathname(req.url) ?? '/', hostname: session.hostname });
 
-  // 请求体流式透传；空体规则：end 事件必发空载 http.body.end
+  // 请求体流式透传；空体规则：end 事件必发空载 http.body.end。
+  // 无需 exceedsMaxDataFrame 护栏：chunk 来自 Node 流读取（≪100MiB），数学上不可能超隧道帧上限；
+  // encodeData 的 PayloadTooLargeError 兜底防协议失配（WS 消息路径尺寸不受控，护栏在 ws-proxy）
   req.on('data', (chunk: Buffer) => {
     if (!finished) tunnel.sendData({ channelId, kind: 'http.body' }, chunk);
   });
