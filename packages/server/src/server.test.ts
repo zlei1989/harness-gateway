@@ -47,6 +47,22 @@ describe('GatewayServer 流量分发', () => {
     expect(() => new GatewayServer({ port: 0, tunnelPath: '/tunnel', logger: nullLogger })).toThrow(/tunnelPath/);
   });
 
+  it('配置非法：keepAliveTimeoutMs 非正整数 → 构造抛错', () => {
+    const bad = (v: number) => () =>
+      new GatewayServer({ port: 0, keepAliveTimeoutMs: v, logger: nullLogger });
+    expect(bad(0)).toThrow(/keepAliveTimeoutMs/);
+    expect(bad(-1)).toThrow(/keepAliveTimeoutMs/);
+    expect(bad(1.5)).toThrow(/keepAliveTimeoutMs/);
+  });
+
+  it('keepAliveTimeoutMs 透传 http.Server：headersTimeout 自动抬到其上（Node 要求 headers > keepAlive）', async () => {
+    server = new GatewayServer({ port: 0, keepAliveTimeoutMs: 65_000, logger: nullLogger });
+    await server.listen();
+    const httpServer = (server as unknown as { httpServer: import('node:http').Server }).httpServer;
+    expect(httpServer.keepAliveTimeout).toBe(65_000);
+    expect(httpServer.headersTimeout).toBeGreaterThan(65_000);
+  });
+
   it('close() 后再请求连接被拒', async () => {
     server = new GatewayServer({ port: 0, logger: nullLogger });
     const port = await server.listen();

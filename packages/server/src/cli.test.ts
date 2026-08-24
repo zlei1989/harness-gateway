@@ -8,8 +8,11 @@ import { describe, expect, it } from 'vitest';
 import { main, parseArgs } from './cli';
 
 describe('parseArgs', () => {
-  it('默认 port 3081', () => {
-    expect(parseArgs([]).port).toBe(3081);
+  it('默认 port 3081，压缩与 keep-alive 默认关闭/未设', () => {
+    const args = parseArgs([]);
+    expect(args.port).toBe(3081);
+    expect(args.tunnelPerMessageDeflate).toBe(false);
+    expect(args.keepAliveTimeoutMs).toBeUndefined();
   });
   it('--port / --tunnel-path / --select-path', () => {
     const args = parseArgs(['--port', '9090', '--tunnel-path', '/t', '--select-path', '/s']);
@@ -18,6 +21,17 @@ describe('parseArgs', () => {
   it('端口非法抛错', () => {
     expect(() => parseArgs(['--port', 'abc'])).toThrow(/port/);
     expect(() => parseArgs(['--port', '70000'])).toThrow(/port/);
+  });
+  it('--tunnel-permessage-deflate 布尔开关', () => {
+    expect(parseArgs(['--tunnel-permessage-deflate']).tunnelPerMessageDeflate).toBe(true);
+  });
+  it('--keep-alive-timeout-ms 正整数', () => {
+    expect(parseArgs(['--keep-alive-timeout-ms', '60000']).keepAliveTimeoutMs).toBe(60_000);
+  });
+  it('--keep-alive-timeout-ms 非法值抛错', () => {
+    expect(() => parseArgs(['--keep-alive-timeout-ms', 'abc'])).toThrow(/keep-alive-timeout-ms/);
+    expect(() => parseArgs(['--keep-alive-timeout-ms', '0'])).toThrow(/keep-alive-timeout-ms/);
+    expect(() => parseArgs(['--keep-alive-timeout-ms'])).toThrow(/keep-alive-timeout-ms/);
   });
   it('未知参数抛错', () => {
     expect(() => parseArgs(['--nope'])).toThrow(/未知参数/);

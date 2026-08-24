@@ -118,12 +118,28 @@ export function handleBrowserHttp(
 
   let finished = false;
   let headTimer: NodeJS.Timeout | null = null;
+  // 分段计时（归因慢请求：headMs = 隧道往返+upstream 首字节；totalMs - headMs ≈ body 流式传输耗时）
+  const startedAt = Date.now();
+  let headAt: number | null = null;
+  let bodyBytes = 0;
+  let finalStatus: number | string | null = null;
   const finish = (fn: () => void): void => {
     if (finished) return;
     finished = true;
     if (headTimer) clearTimeout(headTimer);
     tunnel.unregister(channelId);
     fn();
+    // 完成计时日志：url 只记 pathname（查询串是常见 token 携带位）；bodyBytes 供带宽归因
+    ctx.logger.info('请求完成', {
+      channelId,
+      method: req.method,
+      url: safePathname(req.url) ?? '/',
+      status: finalStatus,
+      headMs: headAt === null ? null : headAt - startedAt,
+      totalMs: Date.now() - startedAt,
+      bodyBytes,
+      hostname: session.hostname,
+    });
   };
 
   const channel: PendingChannel = {
@@ -133,6 +149,7 @@ export function handleBrowserHttp(
         finishHeaders(frame.status, frame.headers);
       } else if (frame.type === 'channel.error') {
         ctx.logger.error('通道级错误（客户端回报）', { channelId, message: frame.message });
+        finalStatus = 502;
         finish(() => {
           if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', ...cors });
           res.end();
@@ -143,6 +160,7 @@ export function handleBrowserHttp(
     },
     onData: (header: DataHeader, payload: Buffer) => {
       if (header.kind === 'http.body') {
+        bodyBytes += payload.length;
         if (!res.write(payload)) {
           // 浏览器侧写缓冲背压：暂停读取由整体 WS bufferedAmount 兜底（v1 不做逐通道背压，spec §4.3）
         }
@@ -151,6 +169,7 @@ export function handleBrowserHttp(
       }
     },
     onTunnelDown: () => {
+      finalStatus = 502;
       finish(() => {
         if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', ...cors });
         res.end();
@@ -162,6 +181,8 @@ export function handleBrowserHttp(
     if (headTimer) clearTimeout(headTimer);
     headTimer = null;
     if (finished) return;
+    headAt = Date.now();
+    finalStatus = status;
     // 响应头剥逐跳头、清上游 access-control-* 后合入 CORS 反射头（set-cookie 数组 Node 原生支持）
     res.writeHead(status, withCors(headers, cors) as Record<string, string | string[]>);
     // SSE 关键：Node 会把响应头缓冲到首个 body 块才发，首事件前长间隙会让浏览器 fetch 悬挂；
@@ -196,6 +217,7 @@ export function handleBrowserHttp(
   // 挂 req 会把每个完整请求误判为中止；res 的 'close' 仍只表示底层连接关闭，writableEnded 区分正常结束
   res.on('close', () => {
     if (!finished && !res.writableEnded) {
+      finalStatus = 'browser-aborted';
       finish(() => tunnel.sendControl({ type: 'channel.close', channelId, reason: 'browser aborted' }));
     }
   });
@@ -203,6 +225,7 @@ export function handleBrowserHttp(
   // 等 http.head 超时（收到 head 后不再设总超时，支持 SSE）
   headTimer = setTimeout(() => {
     ctx.logger.warn('等 http.head 超时', { channelId });
+    finalStatus = 504;
     finish(() => {
       tunnel.sendControl({ type: 'channel.close', channelId, reason: 'head timeout' });
       if (!res.headersSent) res.writeHead(504, { 'content-type': 'text/plain; charset=utf-8', ...cors });

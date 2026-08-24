@@ -182,6 +182,29 @@ describe('e2e：WS 转发', () => {
   });
 });
 
+describe('e2e：隧道压缩', () => {
+  it('tunnelPerMessageDeflate 开启：隧道 WS 协商 permessage-deflate，hello 流程不受影响', async () => {
+    server?.close();
+    server = new GatewayServer({
+      port: 0, headTimeoutMs: 500, helloTimeoutMs: 500,
+      tunnelPerMessageDeflate: true, logger: nullLogger,
+    });
+    port = await server.listen();
+    const client = await connectClient();
+    // ws 客户端默认发起 permessage-deflate：服务端开启后协商成功
+    expect(client.ws?.extensions ?? '').toContain('permessage-deflate');
+    // 全链路仍工作：选择 → 请求 → 响应
+    const cookie = await selectAndGetCookie(client.tunnelId ?? '', 'good-token');
+    const res = await fetch(`${base()}/api/x`, { headers: { cookie } });
+    expect(res.status).toBe(200);
+  });
+
+  it('默认不开启：隧道 WS 无压缩扩展', async () => {
+    const client = await connectClient();
+    expect(client.ws?.extensions ?? '').not.toContain('permessage-deflate');
+  });
+});
+
 describe('e2e：优雅关停', () => {
   /** 限时竞速：窗口内未 resolve 返回 'hang'（定时器 unref 防拖住测试进程） */
   function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | 'hang'> {

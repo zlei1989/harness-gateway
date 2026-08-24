@@ -107,7 +107,8 @@ Express 中间件风格在隧道场景的精确适配：
 ### 3.2 生命周期
 
 - `connect()`：发起连接，首次隧道就绪（收到 `hello.ack`）后 resolve。失败按 §6 重连循环继续、不 reject；超过 `connectTimeoutMs`（默认 60s）仍未就绪则 reject。收到 4409 立即 reject 且**不再重连**（旧版服务端 hostname 冲突码；现行服务端同名并存不会发出，本分支为兼容保留）
-- `close()`：停心跳与重连 → 拒收新 open 帧 → **关闭隧道 WS**（服务端随即注销 hostname，后续请求 502）→ 中止在途通道并释放资源（可配超时强制关闭）
+- `close()`：停心跳与重连 → 拒收新 open 帧 → **关闭隧道 WS**（服务端随即注销 hostname，后续请求 502）→ 中止在途通道并释放资源（可配超时强制关闭）→ 销毁 upstream keep-alive 连接池（空闲 socket 不泄漏到 Client 生命周期之外）
+- **upstream 连接复用**：Client 持有一个与 upstream 协议对应的显式 keep-alive Agent（`keepAlive: true, keepAliveMsecs: 1000`），所有 HTTP 通道共用——高 RTT 链路下每条新建 TCP 都是一次完整握手往返，连接池把 upstream 侧连接成本降为"首次一次"；Agent 随 `close()` 销毁，重连期间连接池保持温热（不随隧道断开重置）
 - 事件：`client.on('connected' | 'disconnected' | 'error', …)`；**必须挂 `error` 监听**（EventEmitter 语义：无监听时 error 事件会抛异常）
 
 ## 4. 隧道帧协议（v1）

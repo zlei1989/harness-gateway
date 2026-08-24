@@ -160,4 +160,26 @@ describe('e2e：隧道全链路', () => {
     expect(upstreamHits.at(-1)?.url).toBe('/api/after');
     await client.close();
   });
+
+  it('upstream 连接复用：连续三次请求共用一条 keep-alive socket，close() 收走连接', async () => {
+    // 高 RTT 链路下每条新建 TCP 都是一次完整握手往返：显式 keep-alive Agent 把
+    // upstream 侧连接成本从"每请求一次"降为"首次一次"，且随 Client 生命周期销毁
+    const sockets: import('node:net').Socket[] = [];
+    upstream.on('connection', (socket) => sockets.push(socket));
+    const client = await makeClient();
+    for (const path of ['/api/one', '/api/two', '/api/three']) {
+      const res = await gateway.request('GET', path, { authorization: 'Bearer t1' });
+      expect(res.status).toBe(200);
+    }
+    expect(upstreamHits.map((h) => h.url)).toEqual(['/api/one', '/api/two', '/api/three']);
+    expect(sockets).toHaveLength(1);
+    // close() 销毁 Agent：upstream 侧空闲 keep-alive 连接必须在短窗内被收走
+    // （500ms 预算：不依赖测试进程里其他长周期计时器的偶发关闭）
+    await client.close();
+    const deadline = Date.now() + 500;
+    while (!sockets[0]?.destroyed && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    expect(sockets[0]?.destroyed).toBe(true);
+  });
 });

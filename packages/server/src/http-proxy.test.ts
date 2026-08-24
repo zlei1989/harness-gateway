@@ -173,6 +173,34 @@ describe('handleBrowserHttp', () => {
     expect(tunnel.closes.length).toBeGreaterThan(0);
   });
 
+  it('请求完成日志：status/headMs/totalMs/bodyBytes 分段计时（url 只记 pathname）', async () => {
+    const records: { message: string; context?: Record<string, unknown> }[] = [];
+    const recordingLogger = {
+      debug() {},
+      info(message: string, context?: Record<string, unknown>) {
+        records.push({ message, context });
+      },
+      warn() {},
+      error() {},
+    } as unknown as import('./logger').Logger;
+    const { port, uuid } = await setup({ logger: recordingLogger });
+    const res = await fetch(`http://127.0.0.1:${port}/api/big?secret=1`, {
+      headers: { cookie: `gateway_sid=${uuid}` },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('upstream-ok');
+    const done = records.find((r) => r.message === '请求完成');
+    expect(done).toBeDefined();
+    const ctx = done?.context as Record<string, unknown>;
+    expect(ctx['status']).toBe(200);
+    expect(ctx['url']).toBe('/api/big'); // 计时日志同样只记 pathname
+    expect(typeof ctx['headMs']).toBe('number');
+    expect(typeof ctx['totalMs']).toBe('number');
+    expect(ctx['bodyBytes']).toBe('upstream-ok'.length);
+    // head 到达早于完成（分段单调）
+    expect((ctx['headMs'] as number) <= (ctx['totalMs'] as number)).toBe(true);
+  });
+
   it('隧道断开（在途通道）→ 502', async () => {
     const { port, tunnel, uuid } = await setup();
     tunnel.autoRespond = null;

@@ -27,12 +27,27 @@ export interface GatewayServerOptions {
   selectPath?: string;
   helloTimeoutMs?: number;
   headTimeoutMs?: number;
+  /**
+   * 隧道 WS 开启 permessage-deflate（跨机房/跨境部署建议开启）：
+   * 压缩隧道帧负载（≥1KB 才压缩，SSE 小帧不受影响），显著降低高 RTT 低带宽链路上的传输时间，
+   * 代价是两端少量 CPU。客户端 ws 默认发起协商，服务端开启即生效。
+   */
+  tunnelPerMessageDeflate?: boolean;
+  /**
+   * 浏览器侧 HTTP keep-alive 空闲超时（毫秒，须为正整数）。
+   * 高 RTT 链路下每条新建 TCP+TLS 是多次完整往返：调大空闲超时让浏览器连接跨页面间隙复用，
+   * 减少重握手。headersTimeout 自动抬到该值之上（Node 要求 headers > keepAlive）。
+   */
+  keepAliveTimeoutMs?: number;
   /** CORS 允许名单（'*' 全放行，'*.jd.com' 匹配本体及子域）；默认 DEFAULT_CORS_ORIGINS */
   corsOrigins?: string[];
   logger?: Logger;
 }
 
 const RESERVED_PREFIX = '/__gateway__/';
+
+/** headersTimeout 兜底抬升量：必须严格大于 keepAliveTimeout（Node 运行时校验） */
+const HEADERS_TIMEOUT_MARGIN_MS = 5_000;
 
 export class GatewayServer {
   private readonly options: Required<Omit<GatewayServerOptions, 'logger'>>;
@@ -47,6 +62,10 @@ export class GatewayServer {
     if (!Number.isInteger(options.port) || options.port < 0 || options.port > 65535) {
       throw new Error('GatewayServerOptions.port 必须是 0-65535 的整数');
     }
+    if (options.keepAliveTimeoutMs !== undefined
+      && (!Number.isInteger(options.keepAliveTimeoutMs) || options.keepAliveTimeoutMs <= 0)) {
+      throw new Error('GatewayServerOptions.keepAliveTimeoutMs 必须是正整数毫秒值');
+    }
     this.logger = options.logger ?? createDefaultLogger();
     this.options = {
       port: options.port,
@@ -54,6 +73,8 @@ export class GatewayServer {
       selectPath: options.selectPath ?? '/__gateway__/select',
       helloTimeoutMs: options.helloTimeoutMs ?? 15_000,
       headTimeoutMs: options.headTimeoutMs ?? 120_000,
+      tunnelPerMessageDeflate: options.tunnelPerMessageDeflate ?? false,
+      keepAliveTimeoutMs: options.keepAliveTimeoutMs ?? 5_000,
       corsOrigins: options.corsOrigins ?? DEFAULT_CORS_ORIGINS,
     };
     // 保留命名空间校验：分发逻辑只在 /__gateway__/ 前缀块内匹配 tunnelPath/selectPath，
@@ -68,6 +89,7 @@ export class GatewayServer {
   /** 启动监听；返回实际绑定端口（port: 0 时用于测试） */
   listen(): Promise<number> {
     const { tunnelPath, selectPath, helloTimeoutMs, headTimeoutMs, corsOrigins } = this.options;
+    const keepAliveTimeoutMs = this.options.keepAliveTimeoutMs;
     const proxyCtx: ProxyContext = {
       tunnels: this.tunnels,
       sessions: this.sessions,
@@ -77,7 +99,12 @@ export class GatewayServer {
       corsAllowOrigin: createOriginMatcher(corsOrigins),
     };
 
-    this.httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
+    // keepAliveTimeout 面向高 RTT 链路调大浏览器连接复用窗口；headersTimeout 必须严格大于
+    // keepAliveTimeout（Node 运行时约束），显式抬到其上加余量，避免两者相等时连接被提前砍
+    this.httpServer = createServer({
+      keepAliveTimeout: keepAliveTimeoutMs,
+      headersTimeout: Math.max(60_000, keepAliveTimeoutMs + HEADERS_TIMEOUT_MARGIN_MS),
+    }, (req: IncomingMessage, res: ServerResponse) => {
       // 畸形 request-target 防线：new URL 抛错不得上溢为 uncaughtException（单请求 DoS），回 400
       const pathname = safePathname(req.url);
       if (pathname === null) {
@@ -111,6 +138,7 @@ export class GatewayServer {
       tunnels: this.tunnels,
       tunnelPath,
       helloTimeoutMs,
+      tunnelPerMessageDeflate: this.options.tunnelPerMessageDeflate,
       logger: this.logger,
     });
 

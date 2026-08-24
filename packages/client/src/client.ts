@@ -5,6 +5,8 @@
  */
 
 import { EventEmitter } from 'node:events';
+import http from 'node:http';
+import https from 'node:https';
 
 import { type AuthDecision, type AuthorizationHook, type AuthRequest, runAuthorization } from './authorize';
 import { Connection, type ReconnectOptions } from './connection';
@@ -47,6 +49,12 @@ export class Client extends EventEmitter {
   private readonly connection: Connection;
   private readonly channels = new Map<number, AnyChannel>();
   private readonly upstream: URL;
+  /**
+   * upstream keep-alive 连接池：高 RTT 链路下每条新建 TCP 都是一次完整握手往返，
+   * 连接复用把 upstream 侧连接成本从"每请求一次"降为"首次一次"。
+   * 实例协议与 upstream 严格对应（https upstream 用 https.Agent），随 close() 销毁。
+   */
+  private readonly agent: http.Agent;
   private readonly authorize: (req: AuthRequest) => Promise<AuthDecision>;
   private readonly logger: Logger;
   private closing = false;
@@ -61,6 +69,11 @@ export class Client extends EventEmitter {
     if (this.upstream.protocol !== 'http:' && this.upstream.protocol !== 'https:') {
       throw new Error('ClientOptions.upstreamUrl 必须是 http/https');
     }
+    // 显式 Agent（Node 20+ 全局 Agent 虽默认 keep-alive，但为全局共享且无人销毁）：
+    // 独立连接池可随 Client 生命周期收走，不与其他组件互相干扰
+    this.agent = this.upstream.protocol === 'https:'
+      ? new https.Agent({ keepAlive: true, keepAliveMsecs: 1000 })
+      : new http.Agent({ keepAlive: true, keepAliveMsecs: 1000 });
     const gateway = new URL(options.gatewayUrl);
     if (gateway.protocol !== 'ws:' && gateway.protocol !== 'wss:') {
       throw new Error('ClientOptions.gatewayUrl 必须是 ws/wss');
@@ -112,7 +125,7 @@ export class Client extends EventEmitter {
     return this.connection.tunnelId;
   }
 
-  /** 优雅关闭：拒收新 open（回执窗口）→ 关隧道（服务端随即注销 hostname）→ 中止在途通道 */
+  /** 优雅关闭：拒收新 open（回执窗口）→ 关隧道（服务端随即注销 hostname）→ 中止在途通道 → 收走连接池 */
   async close(): Promise<void> {
     this.closing = true;
     // 窗口期内 Connection 仍正常路由帧：新 open 走到 openHttp/openWs 的 closing 分支回 channel.error
@@ -121,6 +134,8 @@ export class Client extends EventEmitter {
     // 在途通道必须由本类自行中止，不能依赖断开回调
     await this.connection.close();
     this.abortAllChannels();
+    // 销毁 upstream 连接池：空闲 keep-alive socket 不得泄漏到 Client 生命周期之外
+    this.agent.destroy();
   }
 
   /** 控制帧路由：hello.ack/ping/pong 已被 Connection 消化 */
@@ -170,6 +185,7 @@ export class Client extends EventEmitter {
     const channel = new HttpChannel({
       id: frame.channelId, open: frame, upstream: this.upstream,
       connection: this.connection, authorize: this.authorize, logger: this.logger,
+      agent: this.agent,
       onDone: (id) => this.channels.delete(id),
     });
     this.channels.set(frame.channelId, channel);

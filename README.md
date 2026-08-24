@@ -42,6 +42,10 @@ pnpm run server --port 3081   # 省略 --port 时默认 3081
 | `--port` | `3081` | 单端口承载浏览器 HTTP/WS + 客户端隧道 WS |
 | `--tunnel-path` | `/__gateway__/tunnel` | 隧道接入路径（仅接受 WS upgrade） |
 | `--select-path` | `/__gateway__/select` | 内置选择页路径 |
+| `--tunnel-permessage-deflate` | 关闭 | 隧道 WS 开启 permessage-deflate 压缩（≥1KB 帧才压缩，SSE 小帧不受影响）；跨机房/跨境部署建议开启，显著降低高 RTT 链路传输时间，代价是两端少量 CPU |
+| `--keep-alive-timeout-ms` | `5000` | 浏览器侧 HTTP keep-alive 空闲超时（毫秒，须正整数）；高 RTT 链路建议调大（如 `60000`）让浏览器连接跨页面间隙复用，减少每次新建 TCP 的握手往返。headersTimeout 自动抬到该值之上 |
+
+慢链路排查：服务端按请求记录 `请求完成` 日志（INFO），字段含 `headMs`（入口→收到响应头，即隧道往返+upstream 首字节延迟）与 `totalMs - headMs`（≈body 流式传输耗时）、`bodyBytes`、`status`，可据此定位慢在隧道往返还是带宽。
 
 ### 3. 启动网关客户端（每台被访问的电脑上）
 

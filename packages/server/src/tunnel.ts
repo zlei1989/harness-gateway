@@ -28,6 +28,8 @@ export interface TunnelContext {
   /** 隧道接入保留路径（默认 /__gateway__/tunnel） */
   tunnelPath: string;
   helloTimeoutMs: number;
+  /** 隧道 WS permessage-deflate 开关：跨机房/跨境部署建议开启（压缩 ≥1KB 帧，降低高 RTT 链路传输时间） */
+  tunnelPerMessageDeflate?: boolean;
   logger: Logger;
 }
 
@@ -41,8 +43,13 @@ function toBuffer(data: RawData): Buffer {
 /** 把隧道 upgrade 处理器挂到 http.Server（只处理 tunnelPath，其余路径交还其他监听者） */
 export function attachTunnelHandler(server: Server, ctx: TunnelContext): WebSocketServer {
   // maxPayload 显式对齐隧道帧上限契约（原为 ws 隐式默认 100MiB）：
-  // 双端发送护栏保证隧道帧不超限，此处是对协议失配的显式声明
-  const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_PAYLOAD_BYTES });
+  // 双端发送护栏保证隧道帧不超限，此处是对协议失配的显式声明。
+  // perMessageDeflate 开启时协商压缩：threshold 1KB 使 SSE 小帧原样透传，仅压缩大帧
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: MAX_PAYLOAD_BYTES,
+    ...(ctx.tunnelPerMessageDeflate ? { perMessageDeflate: { threshold: 1024 } } : {}),
+  });
 
   server.on('upgrade', (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     // 畸形 request-target 防线：回调内 new URL 抛错即 uncaughtException 崩进程，销毁 socket 处置

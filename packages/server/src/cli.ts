@@ -16,10 +16,15 @@ export interface CliArgs {
   port: number;
   tunnelPath?: string | undefined;
   selectPath?: string | undefined;
+  /** 隧道 WS permessage-deflate 开关（跨境/跨机房链路建议开启） */
+  tunnelPerMessageDeflate?: boolean;
+  /** 浏览器侧 HTTP keep-alive 空闲超时（毫秒） */
+  keepAliveTimeoutMs?: number;
   help: boolean;
 }
 
-const USAGE = '用法: harness-server [--port <3081>] [--tunnel-path <path>] [--select-path <path>]\n'
+const USAGE = '用法: harness-server [--port <3081>] [--tunnel-path <path>] [--select-path <path>] '
+  + '[--tunnel-permessage-deflate] [--keep-alive-timeout-ms <ms>]\n'
   + '环境变量: HARNESS_CORS_ORIGINS —— 逗号分隔的 CORS 允许名单（默认 *.7qbjs.com,*.jd.com,localhost,127.0.0.1；* 全放行）';
 
 /** 单行诊断：只取 message 首行，剥离堆栈与代码帧 */
@@ -32,6 +37,8 @@ export function parseArgs(argv: string[]): CliArgs {
   let port = 3081;
   let tunnelPath: string | undefined;
   let selectPath: string | undefined;
+  let tunnelPerMessageDeflate = false;
+  let keepAliveTimeoutMs: number | undefined;
   let help = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -49,11 +56,20 @@ export function parseArgs(argv: string[]): CliArgs {
     } else if (arg === '--select-path') {
       selectPath = argv[++i];
       if (!selectPath) throw new Error('--select-path 缺参数值');
+    } else if (arg === '--tunnel-permessage-deflate') {
+      tunnelPerMessageDeflate = true;
+    } else if (arg === '--keep-alive-timeout-ms') {
+      const value = argv[++i];
+      const parsed = Number(value);
+      if (!value || !Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error(`--keep-alive-timeout-ms 非法: ${value}（须正整数毫秒值）`);
+      }
+      keepAliveTimeoutMs = parsed;
     } else {
       throw new Error(`未知参数: ${arg}`);
     }
   }
-  return { port, tunnelPath, selectPath, help };
+  return { port, tunnelPath, selectPath, tunnelPerMessageDeflate, keepAliveTimeoutMs, help };
 }
 
 /** 主流程：返回退出码（0 正常；1 失败） */
@@ -76,6 +92,8 @@ export async function main(argv: string[]): Promise<number> {
       port: args.port,
       tunnelPath: args.tunnelPath,
       selectPath: args.selectPath,
+      tunnelPerMessageDeflate: args.tunnelPerMessageDeflate,
+      keepAliveTimeoutMs: args.keepAliveTimeoutMs,
       corsOrigins: parseCorsOrigins(process.env['HARNESS_CORS_ORIGINS']),
     });
   } catch (err) {

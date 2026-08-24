@@ -88,6 +88,8 @@ const server = new GatewayServer({
   selectPath: '/__gateway__/select',      // 选择页路径（默认值）
   // helloTimeoutMs: 15000,               // 等 hello 帧超时
   // headTimeoutMs: 120000,               // 等 http.head / ws.accept / 探测响应超时
+  // tunnelPerMessageDeflate: true,       // 隧道 WS permessage-deflate 压缩（默认关闭）
+  // keepAliveTimeoutMs: 5000,            // 浏览器侧 keep-alive 空闲超时（headersTimeout 自动抬到其上）
   // logger: Logger
 })
 
@@ -95,7 +97,7 @@ await server.listen()
 await server.close()  // 关所有隧道 + 失败全部在途通道 + 关 http.Server
 ```
 
-CLI：`harness-server --port 3081 [--tunnel-path ...] [--select-path ...]`；非法参数打印用法，退出码 1。SIGINT/SIGTERM 触发 `close()`。
+CLI：`harness-server --port 3081 [--tunnel-path ...] [--select-path ...] [--tunnel-permessage-deflate] [--keep-alive-timeout-ms <ms>]`；非法参数打印用法，退出码 1。SIGINT/SIGTERM 触发 `close()`。
 
 ## 4. 单端口流量分发
 
@@ -201,6 +203,8 @@ cookie 检查：无/失效 gateway_sid → 302 selectPath
 |------|------|------|
 | `helloTimeoutMs` | 15s | 隧道 upgrade 后等 hello 帧 |
 | `headTimeoutMs` | 120s | 等 http.head / ws.accept / 选择页探测响应 |
+| `tunnelPerMessageDeflate` | 关闭 | 隧道 WS permessage-deflate 压缩（threshold 1KB：SSE 小帧不压缩）；跨机房/跨境链路建议开启 |
+| `keepAliveTimeoutMs` | 5s | 浏览器侧 HTTP keep-alive 空闲超时；headersTimeout 自动抬到其上加 5s（Node 要求 headers > keepAlive）。高 RTT 链路建议调大以复用浏览器连接 |
 | body / WS 消息阶段 | 无总超时 | SSE 与长连接 WS 需要；空闲超时 v1 不设 |
 
 | 级别 | 场景 | 行为 |
@@ -213,9 +217,11 @@ cookie 检查：无/失效 gateway_sid → 302 selectPath
 
 ## 9. 日志
 
-沿用仓库日志级别约定（INFO 接入/断开/请求入口，DEBUG 帧流转，ERROR 堆栈+上下文，WARN 重试/超时）。
+沿用仓库日志级别约定（INFO 接入/断开/请求入口/请求完成，DEBUG 帧流转，ERROR 堆栈+上下文，WARN 重试/超时）。
 
-**安全红线：任何级别日志都不打印 token 与 Authorization 头**——隧道接入只记 hostname，会话建立只记 uuid + hostname。
+**请求完成计时（INFO）**：每个浏览器请求终态（含 502/504/中止）记录 `{channelId, method, url(仅 pathname), status, headMs, totalMs, bodyBytes, hostname}`——`headMs`（入口→收到 http.head）归因隧道往返+upstream 首字节延迟，`totalMs - headMs` ≈ body 流式传输耗时，`bodyBytes` 供带宽归因。慢链路（隧道访问页面慢）排查先看这条日志的分段。
+
+**安全红线：任何级别日志都不打印 token 与 Authorization 头**——隧道接入只记 hostname，会话建立只记 uuid + hostname；请求入口/完成日志只记 pathname（查询串是常见 token 携带位）。
 
 ## 10. 测试计划（vitest）
 

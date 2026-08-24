@@ -21,6 +21,11 @@ export interface HttpChannelParams {
   connection: Connection;
   authorize: (req: AuthRequest) => Promise<AuthDecision>;
   logger: Logger;
+  /**
+   * upstream keep-alive 连接池（由 Client 持有并随其销毁；协议与 upstream 一致）。
+   * 缺省时走 Node 全局 Agent。注意运行时实例与 upstream 协议一一对应。
+   */
+  agent?: http.Agent;
   /** 通道结束（完成/被拒/出错/取消）时回调，Client 用它从通道表移除 */
   onDone: (id: number) => void;
 }
@@ -87,7 +92,10 @@ export class HttpChannel {
     if (headers['origin'] !== undefined) headers['origin'] = upstream.origin;
 
     const mod = target.protocol === 'https:' ? https : http;
-    const req = mod.request(target, { method: open.method, headers },
+    // Agent 实例协议与 target 一致（Client 按 upstream 协议创建，SSRF 护栏保证 target 与 upstream 同 origin）；
+    // 统一注解为 https.Agent：它是 http.Agent 子类，可同时满足 http/https 两分支的 request 参数类型
+    const agent = this.params.agent as https.Agent | undefined;
+    const req = mod.request(target, { method: open.method, headers, agent },
       (res) => this.onUpstreamResponse(res));
     req.on('error', (err) => this.onUpstreamError(err));
     this.req = req;
