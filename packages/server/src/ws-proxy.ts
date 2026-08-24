@@ -98,7 +98,7 @@ export function handleBrowserWs(
     writeRawResponse(socket, 401, { 'content-type': 'text/plain; charset=utf-8' }, Buffer.from('unauthorized'));
     return;
   }
-  const tunnel = ctx.tunnels.get(session.hostname);
+  const tunnel = ctx.tunnels.get(session.tunnelId);
   if (!tunnel) {
     writeRawResponse(socket, 502, { 'content-type': 'text/plain; charset=utf-8' }, Buffer.from('tunnel offline'));
     return;

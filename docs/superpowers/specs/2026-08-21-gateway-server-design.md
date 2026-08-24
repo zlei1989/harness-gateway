@@ -4,6 +4,7 @@
 - 状态：已确认（brainstorming 逐节评审通过）
 - 范围：仅服务端包。客户端设计见《2026-08-21-gateway-client-design.md》；隧道帧协议由两份文档共同定义，字段以客户端文档 §4 加本文档 §5 的 hello 扩展为准。
 - 修订：2026-08-21（设计评审修订）——协议保真改为「HTTP/WS 语义保真」消除与客户端 `upstreamUrl` 的歧义；headers 三处加工增加 `X-Forwarded-For` 注入并约定 `string | string[]` 编码；无 body 请求强制空载 `http.body.end` 收尾；`ws.accept` 子协议回选校验；4409 客户端不重连；token 流经隧道的安全提示。
+- 修订：2026-08-24——隧道身份改为服务端分配的 **tunnelId（uuid）**：`hello.ack` 携带 tunnelId、`hello` 支持回带上次 tunnelId 复用（保浏览器会话）；hostname 降为纯展示名、**同名并存**（4409 同名仲裁移除）；选择页改为图标矩阵 + 点击弹框输 token + ajax 异步登录（POST 全 JSON 响应），支持 `?tunnelId=` 深链自动弹框；浏览器会话改挂 tunnelId。
 
 ## 1. 背景与目标
 
@@ -23,12 +24,13 @@
 
 **完整用户旅程**：
 
-1. 各电脑上的客户端主动连网关，`hello` 上报 `{ hostname, defaultPath }`
-2. 浏览器首次访问网关任意路径 → 无有效 cookie → 302 到内置选择页（电脑图标列表）
-3. 用户点击电脑图标、输入 token → 服务端经隧道向该客户端发探测请求验证
-4. 验证通过 → 写 session cookie（uuid）→ 302 跳转到该电脑的 `defaultPath`
-5. 后续请求带 cookie → 路由到对应隧道 → 注入 `Authorization: Bearer {token}` → 客户端鉴权 → upstream
-6. 退出 = 关闭浏览器（session cookie 失效）
+1. 各电脑上的客户端主动连网关，`hello` 上报 `{ hostname, defaultPath }`（重连时回带上次分到的 tunnelId）
+2. 服务端为隧道分配标识 **tunnelId（uuid）**，经 `hello.ack` 返回（客户端 CLI 打印，供拼 `select?tunnelId=` 深链）
+3. 浏览器首次访问网关任意路径 → 无有效 cookie → 302 到内置选择页（电脑图标矩阵，hostname 纯展示名、可重复）
+4. 用户点击电脑图标 → 弹出 token 输入对话框 → **ajax 异步提交**，服务端经隧道向该客户端发探测请求验证
+5. 验证通过 → 写 session cookie（uuid）→ 前端跳转到该电脑的 `defaultPath`；token 错误直接显示在对话框内
+6. 后续请求带 cookie → 路由到对应隧道 → 注入 `Authorization: Bearer {token}` → 客户端鉴权 → upstream
+7. 退出 = 关闭浏览器（session cookie 失效）
 
 ### 1.2 服务端职责
 
@@ -48,7 +50,7 @@
 | 3 | 协议保真 | HTTP/WS 语义保真：浏览器的 HTTP 请求与 WS 升级分别经隧道还原为对 upstream 的同类请求；upstream 的 scheme（http/https）由客户端 `upstreamUrl` 决定 |
 | 4 | TLS | 交给前置反代（nginx/caddy），网关只讲 HTTP/WS |
 | 5 | HTTP 框架 | Node 原生 http + ws（noServer 模式 + upgrade 按路径分发，沿用 `packages/web/server.ts` / `ws-gateway.ts` 范式） |
-| 6 | 多客户端路由 | cookie uuid → hostname → 隧道；hello 帧承载 hostname/defaultPath |
+| 6 | 多客户端路由 | cookie uuid → tunnelId → 隧道；hello 帧承载 hostname/defaultPath（重连回带 tunnelId）；**hostname 纯展示名、可重复** |
 | 7 | token 校验位置 | 选择时经隧道向客户端发探测请求，客户端是唯一鉴权权威；配置 token 不出客户端进程 |
 | 8 | 隧道连接认证 | 无认证（token 是用户级凭证，非隧道接入凭证）；公网部署需自行加前置保护——**token 随转发请求（Bearer 注入）流经隧道，公网务必前置 TLS** |
 | 9 | 选择页技术栈 | 服务端直出零依赖自包含 HTML（**明确偏离** CLAUDE.md 的 antd/Tailwind/DESIGN.md 规范，理由：零依赖转发网关不引入前端构建链；已获确认） |
@@ -114,15 +116,17 @@ upgrade 分发沿用 `ws-gateway.ts` 范式：`WebSocketServer({ noServer: true 
 ```text
 客户端 WS upgrade 命中 tunnelPath
   → 接受 → 等 hello 控制帧（helloTimeoutMs 15s，超时断开）
-       { type:'hello', client:{ hostname, defaultPath } }     ← 不含 token
-  → hostname 与在线隧道重名 → 沿用仓库范式：先 handleUpgrade 再 close(4409, 'hostname conflict')
-     （客户端视 4409 为进程级错误，不会重连，无需防重名互踢）
-  → 回 { type:'hello.ack' }，登记 tunnels: Map<hostname, TunnelSession>
+       { type:'hello', client:{ hostname, defaultPath, tunnelId? } }   ← 不含 token；tunnelId 仅重连时回带
+  → 决定 tunnelId：回带值符合 uuid 形态且当前无在线隧道占用 → 复用；
+     否则（未回带/非法形态/被占用）分配新 randomUUID()——被占用不互踢（无隧道认证现状下避免互踢面）
+  → 回 { type:'hello.ack', tunnelId }，登记 tunnels: Map<tunnelId, TunnelSession>
   → 隧道就绪，开始接受浏览器流量
 ```
 
+- **tunnelId 是隧道路由唯一身份**（2026-08-24 起）：hostname 纯展示名、同名并存，不再有 4409 同名仲裁（客户端保留 4409 处理仅作旧版服务端兼容，属不可达分支）
+- tunnelId 复用的安全边界：仅当回带 id 空闲时复用；冒用他人**离线**隧道的 id 可接管其浏览器会话（Bearer token 会流向冒用者 upstream）——与既有"无隧道认证"风险同级（§1.3-8），uuid 不可猜测反而较原 hostname 键降低了冒充面
 - `channelId`：服务端按隧道会话内递增整数分配；隧道重连后旧会话通道已全部清理，编号空间重置无冲突
-- 隧道断开：该隧道全部在途通道失败（HTTP 502 / WS 断开），`tunnels` 注销 hostname；**`sessions` 保留**——隧道重连后老 cookie 自动恢复可用，免重新选择
+- 隧道断开：该隧道全部在途通道失败（HTTP 502 / WS 断开），`tunnels` 注销 tunnelId；**`sessions` 保留**——客户端回带 tunnelId 重连复用后老 cookie 自动恢复可用，免重新选择（复用失败分到新 id 时老会话随之失效，需重新登录）
 - 心跳：响应客户端 `ping` 控制帧回 `pong`
 
 ## 6. 选择页与浏览器会话（select-page.ts / browser-session.ts）
@@ -130,29 +134,32 @@ upgrade 分发沿用 `ws-gateway.ts` 范式：`WebSocketServer({ noServer: true 
 ### 6.1 内部状态（全内存，重启即清空）
 
 ```ts
-tunnels:  Map<hostname, TunnelSession>     // 在线隧道
-sessions: Map<uuid, { hostname, token }>   // 浏览器会话
+tunnels:  Map<tunnelId, TunnelSession>           // 在线隧道（tunnelId 为服务端分配的 uuid）
+sessions: Map<uuid, { tunnelId, hostname, token }> // 浏览器会话（hostname 快照仅供日志）
 ```
 
 ### 6.2 GET 选择页
 
-- 服务端直出**零依赖自包含 HTML**（字符串模板 + 内联样式）：电脑图标列表（在线 tunnels 的 hostname）+ token 输入框 + 错误提示位
+- 服务端直出**零依赖自包含 HTML**（字符串模板 + 内联样式 + 内联脚本）：在线隧道渲染为**图标矩阵卡片**（每张卡片仅电脑图标 + hostname，携带 `data-tunnel-id`；同名卡片并存），页内一个隐藏模态对话框（token 输入框 + 错误行）
+- 交互由页内脚本完成：点击卡片弹出对话框；提交走 **fetch ajax 异步登录**（不重载页面）；成功按响应 JSON 的 `redirect` 跳转，失败把 `error` 显示在对话框内
+- **深链**：URL 含 `?tunnelId=xxx` 时页内脚本自动弹出对应对话框；tunnelId 不在线 → 顶部错误条"该电脑不在线或已断开"
 - 已带有效 cookie 也允许访问（用于切换电脑）
 
-### 6.3 POST 选择提交（表单：hostname + token）
+### 6.3 POST 选择提交（表单：tunnelId + token；**全 JSON 响应**，不再重渲染整页）
 
 ```text
-hostname 不在线 → 400，重渲染选择页 + 错误提示
+tunnelId 不在线 → 409 { ok:false, error:'该电脑不在线或已断开' }
 在线 → 服务端开一条临时隧道通道发探测请求：
        GET /__gateway__/auth-check
        Authorization: Bearer {用户输入的 token}
   ├─ 客户端回 204（其 authorization 放行）→ 建立会话：
   │    uuid = crypto.randomUUID()
-  │    sessions.set(uuid, { hostname, token })
+  │    sessions.set(uuid, { tunnelId, hostname, token })
   │    Set-Cookie: gateway_sid=uuid; HttpOnly; SameSite=Lax; Path=/   ← session cookie
-  │    302 → 该电脑的 defaultPath
-  ├─ 客户端回 403（钩子拒绝）→ 重渲染选择页 + "token 错误"
-  └─ 探测超时（headTimeoutMs）→ 504 错误提示
+  │    200 { ok:true, redirect: 该电脑的 defaultPath } → 前端 location.assign(redirect)
+  │    （defaultPath 开放重定向防线不变：仅放行站内绝对路径，站外回落 '/'）
+  ├─ 客户端回 403（钩子拒绝）→ 403 { ok:false, error:'token 错误' }（前端显示在对话框内）
+  └─ 探测超时（headTimeoutMs）→ 504 { ok:false, error:'探测超时，请重试' }
 ```
 
 ### 6.4 会话生命周期
@@ -165,7 +172,7 @@ hostname 不在线 → 400，重渲染选择页 + 错误提示
 
 ```text
 cookie 检查：无/失效 gateway_sid → 302 selectPath
-有效 → sessions[uuid] → tunnels[hostname]
+有效 → sessions[uuid] → tunnels[tunnelId]
   隧道已离线 → 502 'tunnel offline'
   在线 → 分配 channelId → http.open { method, url, headers }
     headers 三处加工：
@@ -212,15 +219,15 @@ cookie 检查：无/失效 gateway_sid → 302 selectPath
 
 ## 10. 测试计划（vitest）
 
-- **单测**：cookie 解析与剥离 gateway_sid、sessions/tunnels 映射、帧编解码
+- **单测**：cookie 解析与剥离 gateway_sid、sessions/tunnels 映射（tunnelId 键控）、帧编解码
 - **端到端集成**（同进程起真实 upstream + GatewayServer + Client）：
-  1. 无 cookie → 302 → 选择页含 hostname
-  2. POST 选择：错误 token → 403 提示；正确 token → Set-Cookie + 302 defaultPath
+  1. 无 cookie → 302 → 选择页含 hostname 与 data-tunnel-id；同名两台客户端同时列出
+  2. POST 选择（ajax 口径）：错误 token → 403 JSON 提示；正确 token → Set-Cookie + 200 JSON redirect=defaultPath
   3. 带 cookie GET/POST → upstream 收到 Bearer 注入、无 gateway_sid
   4. SSE 流式端到端
   5. 浏览器 WS echo（text+binary）；客户端鉴权拒绝 → 浏览器收到自定义拒绝响应
-  6. hostname 冲突 → 4409
-  7. 隧道断开 → 在途请求 502 → 重连 → 老 cookie 恢复可用
+  6. 同名并存接入无 4409；hello 回带空闲 tunnelId → 复用；被占用/非法 → 分配新 id
+  7. 隧道断开 → 在途请求 502 → 回带 tunnelId 重连复用 → 老 cookie 恢复可用
 - **CLI**：`--port` 启动、非法参数退出码 1
 
 ## 11. 非目标（v1）

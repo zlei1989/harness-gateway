@@ -1,7 +1,8 @@
 /**
- * TunnelSession（单条隧道连接的通道表）与 TunnelRegistry（hostname → 隧道注册表）。
+ * TunnelSession（单条隧道连接的通道表）与 TunnelRegistry（tunnelId → 隧道注册表）。
  * 注意：channelId 会话内递增，隧道重建后编号空间重置（旧通道已全部 teardown）；
  * registry.delete 校验 session 身份，防止"旧隧道断开事件"误删"新隧道"的重连竞态。
+ * tunnelId 是隧道路由唯一身份（服务端分配的 uuid，可经 hello 回带复用）；hostname 纯展示名、可重复。
  */
 
 import { type ControlFrame, type DataHeader, encodeControl, encodeData } from './protocol';
@@ -34,6 +35,8 @@ const LOW_WATER_BYTES = 4 * 1024 * 1024;
 const DRAIN_POLL_MS = 100;
 
 export class TunnelSession implements TunnelHandle {
+  /** 服务端分配的隧道标识（uuid；hello 回带复用时为回带值） */
+  readonly tunnelId: string;
   readonly hostname: string;
   readonly defaultPath: string;
   private nextChannelId = 1;
@@ -44,10 +47,11 @@ export class TunnelSession implements TunnelHandle {
 
   constructor(
     private readonly ws: WebSocket,
-    info: { hostname: string; defaultPath: string },
+    info: { tunnelId: string; hostname: string; defaultPath: string },
     private readonly logger: Logger,
     private readonly onDown: (session: TunnelSession) => void,
   ) {
+    this.tunnelId = info.tunnelId;
     this.hostname = info.hostname;
     this.defaultPath = info.defaultPath;
   }
@@ -164,26 +168,27 @@ export class TunnelSession implements TunnelHandle {
 export class TunnelRegistry {
   private readonly tunnels = new Map<string, TunnelSession>();
 
-  get(hostname: string): TunnelSession | undefined {
-    return this.tunnels.get(hostname);
+  get(tunnelId: string): TunnelSession | undefined {
+    return this.tunnels.get(tunnelId);
   }
 
-  has(hostname: string): boolean {
-    return this.tunnels.has(hostname);
+  has(tunnelId: string): boolean {
+    return this.tunnels.has(tunnelId);
   }
 
-  set(hostname: string, session: TunnelSession): void {
-    this.tunnels.set(hostname, session);
+  set(tunnelId: string, session: TunnelSession): void {
+    this.tunnels.set(tunnelId, session);
   }
 
   /** 仅当映射仍指向该 session 才删除——防"旧隧道断开"误删"新隧道"的竞态 */
-  delete(hostname: string, session: TunnelSession): void {
-    if (this.tunnels.get(hostname) === session) this.tunnels.delete(hostname);
+  delete(tunnelId: string, session: TunnelSession): void {
+    if (this.tunnels.get(tunnelId) === session) this.tunnels.delete(tunnelId);
   }
 
-  /** 选择页数据源：当前在线电脑列表 */
-  list(): { hostname: string; defaultPath: string }[] {
+  /** 选择页数据源：当前在线电脑列表（hostname 可重复，卡片以 tunnelId 区分） */
+  list(): { tunnelId: string; hostname: string; defaultPath: string }[] {
     return [...this.tunnels.values()].map((s) => ({
+      tunnelId: s.tunnelId,
       hostname: s.hostname,
       defaultPath: s.defaultPath,
     }));

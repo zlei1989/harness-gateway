@@ -94,7 +94,7 @@ export async function main(argv: string[]): Promise<number> {
     console.error('[harness-client] 连接网关失败', err);
     return 1;
   }
-  console.info(`[harness-client] 隧道就绪 hostname=${options.hostname} gateway=${options.gatewayUrl}`);
+  console.info(`[harness-client] 隧道就绪 hostname=${options.hostname} tunnelId=${client.tunnelId ?? '-'} gateway=${options.gatewayUrl}`);
   return 0; // 进程由活跃隧道连接保活
 }
 

@@ -12,10 +12,10 @@ import {
 describe('BrowserSessionStore', () => {
   it('create 返回唯一 uuid，get 可取回', () => {
     const store = new BrowserSessionStore();
-    const a = store.create('pc-a', 't1');
-    const b = store.create('pc-b', 't2');
+    const a = store.create('tid-1', 'pc-a', 't1');
+    const b = store.create('tid-2', 'pc-b', 't2');
     expect(a).not.toBe(b);
-    expect(store.get(a)).toEqual({ hostname: 'pc-a', token: 't1' });
+    expect(store.get(a)).toEqual({ tunnelId: 'tid-1', hostname: 'pc-a', token: 't1' });
     expect(store.get('no-such')).toBeUndefined();
   });
 });

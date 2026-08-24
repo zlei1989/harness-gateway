@@ -19,7 +19,7 @@ export interface ClientOptions {
   upstreamUrl: string;
   /** 网关隧道端点（ws/wss） */
   gatewayUrl: string;
-  /** 选择页展示名与路由标识（全网关内唯一） */
+  /** 选择页展示名（可重复；路由身份由服务端分配的 tunnelId 承担） */
   hostname: string;
   /** 本机接入令牌：配置后未提供 authorization 时启用内置 Bearer 校验 */
   token?: string;
@@ -105,6 +105,11 @@ export class Client extends EventEmitter {
   /** 建立隧道（首连失败内部退避重试，connectTimeoutMs/4409 才 reject） */
   connect(): Promise<void> {
     return this.connection.connect();
+  }
+
+  /** 服务端分配的 tunnelId（hello.ack 后可用）；用户据此拼 select?tunnelId= 深链 */
+  get tunnelId(): string | undefined {
+    return this.connection.tunnelId;
   }
 
   /** 优雅关闭：拒收新 open（回执窗口）→ 关隧道（服务端随即注销 hostname）→ 中止在途通道 */

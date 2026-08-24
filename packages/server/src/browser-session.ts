@@ -7,6 +7,9 @@
 import { randomUUID } from 'node:crypto';
 
 export interface BrowserSession {
+  /** 隧道身份（服务端分配的 tunnelId；隧道断开重连复用后会话自动恢复可用） */
+  tunnelId: string;
+  /** 选择时的展示名快照，仅供日志（hostname 可重复，不参与路由） */
   hostname: string;
   token: string;
 }
@@ -15,9 +18,9 @@ export class BrowserSessionStore {
   private readonly sessions = new Map<string, BrowserSession>();
 
   /** 建立会话，返回 uuid */
-  create(hostname: string, token: string): string {
+  create(tunnelId: string, hostname: string, token: string): string {
     const uuid = randomUUID();
-    this.sessions.set(uuid, { hostname, token });
+    this.sessions.set(uuid, { tunnelId, hostname, token });
     return uuid;
   }
 

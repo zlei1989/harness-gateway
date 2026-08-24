@@ -1,7 +1,9 @@
 /**
  * 网关隧道连接管理 — hello 握手、自动重连（指数退避+抖动）、应用层心跳、聚合背压。
  * 语义（spec §6）：connect() 首连失败按退避持续重试，connectTimeoutMs 内未就绪则 reject；
- * 4409 = 进程级错误（hostname 冲突），connect() 立即 reject 且不重连；重连是全新会话。
+ * 4409 = 进程级错误（旧版服务端 hostname 冲突，现行服务端同名并存不发出），connect() 立即 reject 且不重连。
+ * tunnelId 复用：进程内存记住最近一次 hello.ack 的 tunnelId，重连 hello 回带请求复用
+ * （服务端空闲即复用，浏览器老会话随之恢复）；ack 以服务端最终决定为准更新本地记忆。
  * 注意：hello.ack/ping/pong 在本层消化，不上抛；'error' 事件必须被外层监听（EventEmitter 语义）。
  */
 
@@ -65,6 +67,8 @@ export class Connection extends EventEmitter {
   private lastActivityAt = 0;
   /** 最近一次 hello.ack 就绪时刻（0 = 未就绪），断开诊断日志的 readyMs 基准 */
   private readyAt = 0;
+  /** 最近一次 ack 分配的 tunnelId：重连时经 hello 回带请求复用；进程内存态，重启即遗忘 */
+  private lastTunnelId: string | undefined;
   /** 连续坏帧计数：成功解码任意帧即清零；新连接尝试从零开始 */
   private consecutiveBadFrames = 0;
   /** 坏帧升级 latch：升级为隧道级断开后，close 握手窗内到达的坏帧静默丢弃（防 ERROR 日志洪泛） */
@@ -86,6 +90,11 @@ export class Connection extends EventEmitter {
   /** 隧道是否就绪（已收到 hello.ack） */
   get ready(): boolean {
     return this.readyState;
+  }
+
+  /** 服务端分配的 tunnelId（未就绪过为 undefined） */
+  get tunnelId(): string | undefined {
+    return this.lastTunnelId;
   }
 
   /** 建立隧道：首连失败持续退避重试；connectTimeoutMs 未就绪 / 4409 → reject */
@@ -177,8 +186,12 @@ export class Connection extends EventEmitter {
       // 过期/关闭守卫：closing 中或已被更新尝试取代的旧 ws，不得再发 hello
       if (this.closing || this.ws !== ws) return;
       this.lastActivityAt = Date.now();
-      // 首帧必须是 hello（spec §4.1：连接建立后首帧发送，不含 token）
-      ws.send(encodeControl({ type: 'hello', client: this.opts.hello }));
+      // 首帧必须是 hello（spec §4.1：连接建立后首帧发送，不含 token）；
+      // 重连回带上次 tunnelId 请求复用（服务端空闲即保留浏览器会话，首连无此字段）
+      const client = this.lastTunnelId
+        ? { ...this.opts.hello, tunnelId: this.lastTunnelId }
+        : this.opts.hello;
+      ws.send(encodeControl({ type: 'hello', client }));
     });
 
     ws.on('message', (data: WebSocket.RawData, isBinary: boolean) => {
@@ -267,11 +280,16 @@ export class Connection extends EventEmitter {
   private handleControl(frame: ControlFrame): void {
     if (this.closing) return;
     if (frame.type === 'hello.ack') {
+      // 记忆服务端决定的 tunnelId（复用或新分配均以 ack 为准）；
+      // typeof 守卫兼容旧版服务端空 ack（缺字段时保持 undefined，不参与回带）
+      if (typeof frame.tunnelId === 'string' && frame.tunnelId.length > 0) {
+        this.lastTunnelId = frame.tunnelId;
+      }
       this.readyState = true;
       this.readyAt = Date.now();
       this.attempts = 0; // 重连成功后重置退避
       this.startHeartbeat();
-      this.opts.logger.info('隧道就绪', { hostname: this.opts.hello.hostname });
+      this.opts.logger.info('隧道就绪', { hostname: this.opts.hello.hostname, tunnelId: this.lastTunnelId });
       this.emit('connected');
       this.connectResolve?.();
       return;

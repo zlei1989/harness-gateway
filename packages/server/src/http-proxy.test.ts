@@ -19,6 +19,7 @@ const nullLogger = { debug() {}, info() {}, warn() {}, error() {} } as unknown a
 
 /** 假隧道：捕获 open 帧与 body 数据，测试驱动其回包 */
 class FakeTunnel {
+  readonly tunnelId = 'tid-1';
   readonly hostname = 'pc-a';
   readonly defaultPath = '/';
   openFrames: Extract<ControlFrame, { type: 'http.open' }>[] = [];
@@ -89,10 +90,10 @@ async function setup(opts: { withTunnel?: boolean; headTimeoutMs?: number; logge
   const tunnel = new FakeTunnel();
   const tunnels = new TunnelRegistry();
   if (opts.withTunnel !== false) {
-    (tunnels as unknown as { tunnels: Map<string, unknown> }).tunnels.set('pc-a', tunnel);
+    (tunnels as unknown as { tunnels: Map<string, unknown> }).tunnels.set('tid-1', tunnel);
   }
   const sessions = new BrowserSessionStore();
-  const uuid = sessions.create('pc-a', 'tok-user');
+  const uuid = sessions.create('tid-1', 'pc-a', 'tok-user');
   const ctx: ProxyContext = {
     tunnels,
     sessions,

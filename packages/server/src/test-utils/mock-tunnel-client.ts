@@ -22,18 +22,23 @@ export interface MockTunnelClientOptions {
 export class MockTunnelClient {
   /** 服务端转发来的业务请求记录（断言 Bearer 注入/cookie 剥离/XFF 用） */
   httpOpens: Extract<ControlFrame, { type: 'http.open' }>[] = [];
+  /** 最近一次 hello.ack 分到的 tunnelId（模拟真实客户端：重连时经 hello 回带请求复用） */
+  tunnelId: string | undefined;
   ws: WebSocket | null = null;
   private bodies = new Map<number, Buffer[]>();
 
   constructor(private readonly opts: MockTunnelClientOptions) {}
 
-  /** 连接 + hello；ack 后 resolve */
+  /** 连接 + hello（有记忆则回带 tunnelId）；ack 后 resolve */
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(this.opts.gatewayUrl);
       this.ws = ws;
       ws.on('open', () => {
-        ws.send(encodeControl({ type: 'hello', client: { hostname: this.opts.hostname, defaultPath: this.opts.defaultPath ?? '/' } }));
+        const client = this.tunnelId
+          ? { hostname: this.opts.hostname, defaultPath: this.opts.defaultPath ?? '/', tunnelId: this.tunnelId }
+          : { hostname: this.opts.hostname, defaultPath: this.opts.defaultPath ?? '/' };
+        ws.send(encodeControl({ type: 'hello', client }));
       });
       ws.on('message', (raw, isBinary) => {
         const buf = Buffer.isBuffer(raw) ? raw : Buffer.from(raw as ArrayBuffer);
@@ -43,8 +48,10 @@ export class MockTunnelClient {
           return;
         }
         const frame = decodeControl(buf.toString('utf8'));
-        if (frame.type === 'hello.ack') resolve();
-        else this.onControl(frame);
+        if (frame.type === 'hello.ack') {
+          this.tunnelId = frame.tunnelId; // 以服务端最终决定为准
+          resolve();
+        } else this.onControl(frame);
       });
       ws.on('error', reject);
     });

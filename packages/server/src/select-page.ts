@@ -1,6 +1,10 @@
 /**
  * 内置选择页 — 零依赖自包含 HTML（spec §6；明确偏离 antd/DESIGN.md 规范，零依赖网关不引入前端构建链）。
- * POST 处理：解析表单 → hostname 在线校验 → 经隧道探测 token（客户端是唯一鉴权权威）→ 建会话 + 302。
+ * 页面形态：在线电脑图标矩阵（卡片仅图标+hostname，携带 data-tunnel-id；同名并存以 tunnelId 区分）+
+ * 隐藏模态对话框（token 输入）；点击卡片弹框，?tunnelId=xxx 深链自动弹框；登录走 fetch ajax，
+ * 成功按响应 JSON 的 redirect 跳转，失败把 error 显示在对话框内（不重载页面）。
+ * POST 处理：解析表单（tunnelId + token）→ tunnelId 在线校验 → 经隧道探测 token（客户端是唯一鉴权权威）
+ * → 建会话 + 200 JSON（Set-Cookie）；全部响应为 JSON，不再重渲染整页。
  * 安全注意：hostname 是客户端可控输入，渲染必须 HTML 转义；表单体限 64KB 防内存放大；
  * token 只在内存与隧道帧中流转，任何日志/响应都不得打印。
  */
@@ -18,7 +22,7 @@ export interface SelectContext {
   logger: Logger;
 }
 
-/** HTML 转义（选择页唯一用户可控输出点） */
+/** HTML 转义（选择页唯一用户可控输出点；同时覆盖属性与文本两处插入位） */
 function escapeHtml(text: string): string {
   return text
     .replaceAll('&', '&amp;')
@@ -27,20 +31,20 @@ function escapeHtml(text: string): string {
     .replaceAll('"', '&quot;');
 }
 
-/** 渲染选择页：在线电脑图标列表 + token 输入；error 非空时展示错误条 */
-export function renderSelectPage(computers: { hostname: string }[], error?: string): string {
+/**
+ * 渲染选择页：电脑图标矩阵 + 隐藏模态对话框 + 页内脚本。
+ * 脚本插入位全部为静态文本；动态数据（hostname/tunnelId）只经 data 属性入 DOM，
+ * 脚本侧用 textContent 读取展示，不构成 HTML/JS 注入面。
+ */
+export function renderSelectPage(computers: { tunnelId: string; hostname: string }[]): string {
   const items = computers.map((c) => {
     const name = escapeHtml(c.hostname);
     return `
-      <form class="card" method="post" action="/__gateway__/select">
+      <button type="button" class="card" data-tunnel-id="${escapeHtml(c.tunnelId)}" data-name="${name}">
         <div class="icon">🖥️</div>
         <div class="name">${name}</div>
-        <input type="hidden" name="hostname" value="${name}" />
-        <input type="password" name="token" placeholder="请输入 token" required autocomplete="off" />
-        <button type="submit">连接</button>
-      </form>`;
+      </button>`;
   }).join('\n');
-  const errorBar = error ? `<div class="error">${escapeHtml(error)}</div>` : '';
   const empty = computers.length === 0 ? '<p class="empty">暂无在线电脑</p>' : '';
   return `<!doctype html>
 <html lang="zh-CN">
@@ -53,24 +57,139 @@ export function renderSelectPage(computers: { hostname: string }[], error?: stri
   main { width: 640px; }
   h1 { font-size: 20px; margin-bottom: 24px; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 16px; }
-  .card { background: #fff; border: 1px solid #e5e6eb; border-radius: 8px; padding: 24px 16px; text-align: center; }
+  .card { background: #fff; border: 1px solid #e5e6eb; border-radius: 8px; padding: 24px 16px; text-align: center; cursor: pointer; font: inherit; color: inherit; }
+  .card:hover { border-color: #165dff; }
   .icon { font-size: 40px; }
-  .name { margin: 8px 0 12px; font-weight: 500; word-break: break-all; }
-  input[type=password] { width: 100%; box-sizing: border-box; padding: 6px 8px; margin-bottom: 8px; border: 1px solid #e5e6eb; border-radius: 4px; }
-  button { width: 100%; padding: 6px 0; border: none; border-radius: 4px; background: #165dff; color: #fff; cursor: pointer; }
+  .name { margin-top: 8px; font-weight: 500; word-break: break-all; }
   .error { background: #ffece8; color: #cb2634; border-radius: 4px; padding: 8px 12px; margin-bottom: 16px; }
   .empty { color: #86909c; }
+  .mask { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); display: flex; align-items: center; justify-content: center; }
+  /* author 的 display:flex 会盖掉 hidden 属性的 UA 默认样式（[hidden]{display:none}），
+     缺了这条遮罩常驻全屏：弹窗始终可见且拦截全部卡片点击（线上 bug 回归防线） */
+  .mask[hidden] { display: none; }
+  .dialog { background: #fff; border-radius: 8px; padding: 24px; width: 320px; }
+  .dialog-title { font-size: 16px; font-weight: 500; margin-bottom: 16px; word-break: break-all; }
+  .dialog input { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid #e5e6eb; border-radius: 4px; }
+  .dialog-error { color: #cb2634; font-size: 13px; margin-top: 8px; }
+  .dialog-actions { display: flex; gap: 8px; margin-top: 16px; }
+  .dialog-actions button { flex: 1; padding: 6px 0; border: none; border-radius: 4px; cursor: pointer; }
+  .btn-primary { background: #165dff; color: #fff; }
+  .btn-cancel { background: #f2f3f5; color: #4e5969; }
+  .dialog-actions button[disabled] { opacity: 0.6; cursor: default; }
 </style>
 </head>
 <body>
 <main>
   <h1>选择要连接的电脑</h1>
-  ${errorBar}
+  <div class="error" id="pageError" hidden></div>
   ${empty}
   <div class="grid">
     ${items}
   </div>
 </main>
+<div class="mask" id="mask" hidden>
+  <div class="dialog" role="dialog" aria-modal="true">
+    <div class="dialog-title" id="dialogTitle"></div>
+    <input type="password" id="tokenInput" placeholder="请输入 token" autocomplete="off" />
+    <div class="dialog-error" id="dialogError" hidden></div>
+    <div class="dialog-actions">
+      <button type="button" class="btn-cancel" id="cancelBtn">取消</button>
+      <button type="button" class="btn-primary" id="okBtn">连接</button>
+    </div>
+  </div>
+</div>
+<script>
+(function () {
+  var mask = document.getElementById('mask');
+  var title = document.getElementById('dialogTitle');
+  var input = document.getElementById('tokenInput');
+  var dialogError = document.getElementById('dialogError');
+  var pageError = document.getElementById('pageError');
+  var okBtn = document.getElementById('okBtn');
+  var cancelBtn = document.getElementById('cancelBtn');
+  var cards = Array.prototype.slice.call(document.querySelectorAll('.card'));
+  var currentId = null;
+  var submitting = false;
+
+  /** 打开对话框：标题为电脑名（textContent 写入，无注入面），清空上次的 token 与错误 */
+  function openDialog(id, name) {
+    currentId = id;
+    title.textContent = name;
+    dialogError.hidden = true;
+    dialogError.textContent = '';
+    input.value = '';
+    mask.hidden = false;
+    input.focus();
+  }
+  function closeDialog() {
+    mask.hidden = true;
+    currentId = null;
+  }
+  /** 错误直接显示在对话框内（不关框，用户改 token 后可立即重试） */
+  function showDialogError(msg) {
+    dialogError.textContent = msg;
+    dialogError.hidden = false;
+  }
+
+  cards.forEach(function (card) {
+    card.addEventListener('click', function () {
+      openDialog(card.getAttribute('data-tunnel-id'), card.getAttribute('data-name'));
+    });
+  });
+  cancelBtn.addEventListener('click', closeDialog);
+  // 点击遮罩空白处关框（点对话框内部不关）
+  mask.addEventListener('click', function (ev) { if (ev.target === mask) closeDialog(); });
+  document.addEventListener('keydown', function (ev) {
+    if (mask.hidden) return;
+    if (ev.key === 'Escape') closeDialog();
+    // 输入框内回车 = 提交（对话框非 form，需手动绑定）
+    if (ev.key === 'Enter' && document.activeElement === input) submit();
+  });
+  okBtn.addEventListener('click', submit);
+
+  /** ajax 登录：POST 当前路径（选择页路径）；200 → 跳 redirect；其余状态 → 错误入对话框 */
+  function submit() {
+    if (submitting || currentId === null) return;
+    var token = input.value;
+    if (!token) { showDialogError('请输入 token'); return; }
+    submitting = true;
+    okBtn.disabled = true;
+    fetch(location.pathname, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ tunnelId: currentId, token: token }),
+    }).then(function (res) {
+      return res.json().catch(function () { return { ok: false, error: '服务响应异常' }; }).then(function (data) {
+        if (res.status === 200 && data.ok && data.redirect) {
+          location.assign(data.redirect); // Set-Cookie 已随响应落盘，跳转即带会话
+          return;
+        }
+        showDialogError(data.error || '登录失败（HTTP ' + res.status + '）');
+      });
+    }).catch(function () {
+      showDialogError('网络错误，请重试');
+    }).finally(function () {
+      submitting = false;
+      okBtn.disabled = false;
+    });
+  }
+
+  // 深链：?tunnelId=xxx 直接弹出对应对话框；不在线则顶部错误条提示
+  var deepId = new URLSearchParams(location.search).get('tunnelId');
+  if (deepId) {
+    var hit = null;
+    cards.forEach(function (card) {
+      if (card.getAttribute('data-tunnel-id') === deepId) hit = card;
+    });
+    if (hit) {
+      openDialog(deepId, hit.getAttribute('data-name'));
+    } else {
+      pageError.textContent = '该电脑不在线或已断开';
+      pageError.hidden = false;
+    }
+  }
+})();
+</script>
 </body>
 </html>`;
 }
@@ -141,7 +260,18 @@ function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
   });
 }
 
-/** POST 选择提交：hostname 在线校验 → 隧道探测 → 建会话 + 302 defaultPath */
+/** 写 JSON 响应（选择页 ajax 契约：全部响应 JSON，前端按 status + ok/error/redirect 分发） */
+function sendJson(
+  res: ServerResponse,
+  status: number,
+  body: Record<string, unknown>,
+  extraHeaders?: Record<string, string>,
+): void {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...extraHeaders });
+  res.end(JSON.stringify(body));
+}
+
+/** POST 选择提交：tunnelId 在线校验 → 隧道探测 → 建会话 + 200 JSON redirect（全 JSON 响应，不重渲染整页） */
 export async function handleSelectPost(
   req: IncomingMessage,
   res: ServerResponse,
@@ -156,36 +286,29 @@ export async function handleSelectPost(
     res.end('bad form', () => req.destroy());
     return;
   }
-  const hostname = form.get('hostname') ?? '';
+  const tunnelId = form.get('tunnelId') ?? '';
   const token = form.get('token') ?? '';
-  const tunnel = ctx.tunnels.get(hostname);
+  const tunnel = ctx.tunnels.get(tunnelId);
   if (!tunnel) {
-    ctx.logger.warn('选择失败：hostname 不在线', { hostname });
-    res.writeHead(400, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(renderSelectPage(ctx.tunnels.list(), '该电脑不在线'));
+    ctx.logger.warn('选择失败：tunnelId 不在线', { tunnelId });
+    sendJson(res, 409, { ok: false, error: '该电脑不在线或已断开' });
     return;
   }
   const result = await probeAuthCheck(tunnel, token, ctx.headTimeoutMs);
   if (result === 'pass') {
-    const uuid = ctx.sessions.create(hostname, token);
-    ctx.logger.info('会话建立', { uuid, hostname }); // 红线：不记录 token
+    const uuid = ctx.sessions.create(tunnelId, tunnel.hostname, token);
+    ctx.logger.info('会话建立', { uuid, tunnelId, hostname: tunnel.hostname }); // 红线：不记录 token
     // defaultPath 是客户端可控输入：仅放行站内绝对路径（'/' 开头且非 '//'），
-    // 站外 URL/协议相对 URL 回落 '/'，防 302 开放重定向
+    // 站外 URL/协议相对 URL 回落 '/'，防开放重定向（经 JSON redirect 到达前端 location.assign）
     const target = tunnel.defaultPath.startsWith('/') && !tunnel.defaultPath.startsWith('//')
       ? tunnel.defaultPath
       : '/';
-    res.writeHead(302, {
-      'set-cookie': buildSessionCookie(uuid),
-      location: target,
-    });
-    res.end();
+    sendJson(res, 200, { ok: true, redirect: target }, { 'set-cookie': buildSessionCookie(uuid) });
     return;
   }
   if (result === 'timeout') {
-    res.writeHead(504, { 'content-type': 'text/html; charset=utf-8' });
-    res.end(renderSelectPage(ctx.tunnels.list(), '探测超时，请重试'));
+    sendJson(res, 504, { ok: false, error: '探测超时，请重试' });
     return;
   }
-  res.writeHead(403, { 'content-type': 'text/html; charset=utf-8' });
-  res.end(renderSelectPage(ctx.tunnels.list(), 'token 错误'));
+  sendJson(res, 403, { ok: false, error: 'token 错误' });
 }

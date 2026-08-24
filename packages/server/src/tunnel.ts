@@ -1,12 +1,17 @@
 /**
- * 隧道接入 — tunnelPath 的 WS upgrade、hello 握手、hostname 唯一性仲裁。
- * 关闭码约定：4409 = hostname 冲突（客户端进程级错误，不重连，无需防互踢）；
- * 4408 = hello 超时；握手后才收 hello，超时前到达的其他帧一律按协议错误断开。
+ * 隧道接入 — tunnelPath 的 WS upgrade、hello 握手、tunnelId 分配与复用。
+ * tunnelId 是隧道路由唯一身份：服务端分配 uuid 并经 hello.ack 下发；客户端重连时在 hello
+ * 回带上次 tunnelId，空闲即复用（浏览器会话随之恢复），被占用/非法则新分配（不互踢——
+ * 无隧道认证现状下避免互踢面，僵尸连接场景由重新登录兜底）。
+ * hostname 为纯展示名、同名并存，不再有 4409 同名仲裁。
+ * 关闭码约定：4408 = hello 超时；握手后才收 hello，超时前到达的其他帧一律按协议错误断开。
  * 已就绪后坏帧降级（spec §8 帧级）：单条畸形帧 WARN + 丢弃，连续 5 帧才按隧道级
  * 协议错误 1002 断开（与客户端 connection.ts 对称，防双向协议失配时空转挂死）。
  * 注意：沿用仓库 ws-gateway.ts 范式——先 handleUpgrade 完成握手，再 close(code) 透传业务关闭码。
- * 安全红线：hello 帧可能携带 token（预留字段），日志不得打印 hello 帧内容（仅记 hostname/错误摘要）。
+ * 安全红线：hello 帧可能携带 token（预留字段），日志不得打印 hello 帧内容（仅记 hostname/tunnelId/错误摘要）。
  */
+
+import { randomUUID } from 'node:crypto';
 
 import { type RawData, type WebSocket, WebSocketServer } from 'ws';
 
@@ -56,7 +61,19 @@ export function attachTunnelHandler(server: Server, ctx: TunnelContext): WebSock
 /** 坏帧降级预算（与客户端 connection.ts 对称）：连续 N 帧解码失败才升级为隧道级协议错误断开 */
 const MAX_CONSECUTIVE_BAD_FRAMES = 5;
 
-/** 隧道连接生命周期：等 hello → 仲裁 → 登记 → 帧路由 → 断开清理 */
+/** 回带 tunnelId 的合法形态（randomUUID v4 形状）；不符一律视为未回带，分配新 id */
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * 决定隧道 tunnelId：回带值形态合法且当前无在线隧道占用 → 复用（浏览器老会话随之恢复）；
+ * 否则分配新 randomUUID——被占用不互踢（无隧道认证现状下避免互踢面，僵尸连接由重新登录兜底）
+ */
+function resolveTunnelId(requested: string | undefined, tunnels: TunnelRegistry): string {
+  const reusable = requested !== undefined && UUID_SHAPE.test(requested) && !tunnels.has(requested);
+  return reusable ? requested : randomUUID();
+}
+
+/** 隧道连接生命周期：等 hello → 定 tunnelId → 登记 → 帧路由 → 断开清理 */
 function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
   let session: TunnelSession | null = null;
   /** 连续坏帧计数：成功解码任意帧即清零（仅就绪后路由阶段使用） */
@@ -80,11 +97,13 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
       }
       let hostname: string;
       let defaultPath: string;
+      let requestedId: string | undefined;
       try {
         const frame = decodeControl(buf.toString('utf8'));
         if (frame.type !== 'hello') throw new ProtocolError(`首帧非 hello: ${frame.type}`);
         hostname = frame.client.hostname;
         defaultPath = frame.client.defaultPath;
+        requestedId = frame.client.tunnelId; // 重连复用回带（可缺省）
         if (!hostname) throw new ProtocolError('hello.hostname 为空');
       } catch (err) {
         // 仅记错误摘要（ProtocolError 消息不含帧原文，防泄 token）
@@ -93,19 +112,14 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
         return;
       }
       clearTimeout(helloTimer);
-      // hostname 唯一性仲裁：先握手再 4409 关闭（仓库范式，业务关闭码可透传）
-      if (ctx.tunnels.has(hostname)) {
-        ctx.logger.warn('hostname 冲突，拒绝接入', { hostname });
-        ws.close(4409, 'hostname conflict');
-        return;
-      }
-      session = new TunnelSession(ws, { hostname, defaultPath }, ctx.logger, (s) => {
-        ctx.tunnels.delete(s.hostname, s); // 身份校验防重连竞态
-        ctx.logger.info('隧道断开', { hostname: s.hostname });
+      const tunnelId = resolveTunnelId(requestedId, ctx.tunnels);
+      session = new TunnelSession(ws, { tunnelId, hostname, defaultPath }, ctx.logger, (s) => {
+        ctx.tunnels.delete(s.tunnelId, s); // 身份校验防重连竞态
+        ctx.logger.info('隧道断开', { hostname: s.hostname, tunnelId: s.tunnelId });
       });
-      ctx.tunnels.set(hostname, session);
-      ws.send(encodeControl({ type: 'hello.ack' }));
-      ctx.logger.info('隧道接入', { hostname });
+      ctx.tunnels.set(tunnelId, session);
+      ws.send(encodeControl({ type: 'hello.ack', tunnelId }));
+      ctx.logger.info('隧道接入', { hostname, tunnelId, reused: tunnelId === requestedId });
       return;
     }
     // 已就绪：帧路由

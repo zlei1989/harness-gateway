@@ -8,8 +8,8 @@ export type HeadersJson = Record<string, string | string[]>;
 
 // ---- 控制帧 ----
 
-export interface HelloFrame { type: 'hello'; client: { hostname: string; defaultPath: string } }
-export interface HelloAckFrame { type: 'hello.ack' }
+export interface HelloFrame { type: 'hello'; client: { hostname: string; defaultPath: string; tunnelId?: string } }
+export interface HelloAckFrame { type: 'hello.ack'; tunnelId: string }
 export interface HttpOpenFrame { type: 'http.open'; channelId: number; method: string; url: string; headers: HeadersJson }
 export interface WsOpenFrame { type: 'ws.open'; channelId: number; url: string; headers: HeadersJson; protocols: string[] }
 /** 双向：网关→客户端 = 浏览器侧关闭/取消；客户端→网关 = upstream 主动关闭/中止 */

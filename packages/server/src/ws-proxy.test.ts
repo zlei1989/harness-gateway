@@ -14,6 +14,7 @@ const nullLogger = { debug() {}, info() {}, warn() {}, error() {} } as unknown a
 
 /** 假隧道：捕获 ws.open，测试驱动 accept/reject/message */
 class FakeTunnel {
+  readonly tunnelId = 'tid-1';
   readonly hostname = 'pc-a';
   openFrames: Extract<ControlFrame, { type: 'ws.open' }>[] = [];
   messages: { dataType?: string; payload: Buffer }[] = [];
@@ -101,7 +102,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
 async function setup(logger: import('./logger').Logger = nullLogger): Promise<string> {
   tunnel = new FakeTunnel();
   const tunnels = new TunnelRegistry();
-  (tunnels as unknown as { tunnels: Map<string, unknown> }).tunnels.set('pc-a', tunnel);
+  (tunnels as unknown as { tunnels: Map<string, unknown> }).tunnels.set('tid-1', tunnel);
   sessions = new BrowserSessionStore();
   const ctx: ProxyContext = { tunnels, sessions, selectPath: '/__gateway__/select', headTimeoutMs: 300, logger };
   server = createServer((_req, res) => { res.writeHead(404); res.end(); });
@@ -114,7 +115,7 @@ async function setup(logger: import('./logger').Logger = nullLogger): Promise<st
   const addr = server!.address();
   if (typeof addr === 'string' || !addr) throw new Error('no addr');
   port = addr.port;
-  return sessions.create('pc-a', 'tok-user');
+  return sessions.create('tid-1', 'pc-a', 'tok-user');
 }
 
 function connectBrowser(path: string, cookie?: string, protocols: string[] = []): WebSocket {
@@ -195,9 +196,9 @@ describe('handleBrowserWs', () => {
     // accept 等待窗内对端 RST 的 ECONNRESET 以未处理 'error' 事件抛出 → 进程崩溃
     const tunnels = new TunnelRegistry();
     tunnel = new FakeTunnel();
-    (tunnels as unknown as { tunnels: Map<string, unknown> }).tunnels.set('pc-a', tunnel);
+    (tunnels as unknown as { tunnels: Map<string, unknown> }).tunnels.set('tid-1', tunnel);
     const sessions2 = new BrowserSessionStore();
-    const uuid = sessions2.create('pc-a', 'tok-user');
+    const uuid = sessions2.create('tid-1', 'pc-a', 'tok-user');
     const ctx: ProxyContext = { tunnels, sessions: sessions2, selectPath: '/__gateway__/select', headTimeoutMs: 300, logger: nullLogger };
     const req = { headers: { cookie: `gateway_sid=${uuid}` }, socket: { remoteAddress: '127.0.0.1' } } as unknown as IncomingMessage;
     const socket = new FakeSocket();

@@ -14,7 +14,8 @@ describe('控制帧编解码', () => {
   it('全部控制帧类型 round-trip', () => {
     const frames: ControlFrame[] = [
       { type: 'hello', client: { hostname: 'pc-a', defaultPath: '/' } },
-      { type: 'hello.ack' },
+      { type: 'hello', client: { hostname: 'pc-a', defaultPath: '/', tunnelId: '3f6f9c40-1c6b-4a12-9a1e-3f0a1c2d4e5f' } },
+      { type: 'hello.ack', tunnelId: '3f6f9c40-1c6b-4a12-9a1e-3f0a1c2d4e5f' },
       { type: 'http.open', channelId: 1, method: 'GET', url: '/api/x', headers: { accept: 'application/json' } },
       { type: 'ws.open', channelId: 2, url: '/ws', headers: {}, protocols: ['chat'] },
       { type: 'channel.close', channelId: 1, code: 1000, reason: 'bye' },

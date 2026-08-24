@@ -52,7 +52,7 @@ function makeChannel(kind: 'http' | 'ws' = 'http') {
 function makeSession(logger: import('./logger').Logger = nullLogger) {
   const ws = new FakeWs();
   const down: TunnelSession[] = [];
-  const session = new TunnelSession(ws.asWs(), { hostname: 'pc-a', defaultPath: '/home' }, logger, (s) => down.push(s));
+  const session = new TunnelSession(ws.asWs(), { tunnelId: 'tid-1', hostname: 'pc-a', defaultPath: '/home' }, logger, (s) => down.push(s));
   return { ws, session, down };
 }
 
@@ -167,16 +167,29 @@ describe('TunnelSession', () => {
 });
 
 describe('TunnelRegistry', () => {
-  it('set/get/list/delete（delete 校验 session 身份防重连竞态）', () => {
+  it('set/get/list/delete 以 tunnelId 为键（delete 校验 session 身份防重连竞态）', () => {
     const registry = new TunnelRegistry();
     const { session } = makeSession();
-    registry.set('pc-a', session);
-    expect(registry.get('pc-a')).toBe(session);
-    expect(registry.list()).toEqual([{ hostname: 'pc-a', defaultPath: '/home' }]);
+    expect(session.tunnelId).toBe('tid-1');
+    registry.set('tid-1', session);
+    expect(registry.get('tid-1')).toBe(session);
+    expect(registry.list()).toEqual([{ tunnelId: 'tid-1', hostname: 'pc-a', defaultPath: '/home' }]);
     const other = makeSession().session;
-    registry.delete('pc-a', other); // 身份不符，不删
-    expect(registry.has('pc-a')).toBe(true);
-    registry.delete('pc-a', session);
-    expect(registry.has('pc-a')).toBe(false);
+    registry.delete('tid-1', other); // 身份不符，不删
+    expect(registry.has('tid-1')).toBe(true);
+    registry.delete('tid-1', session);
+    expect(registry.has('tid-1')).toBe(false);
+  });
+
+  it('同名 hostname 的两条隧道并存（hostname 纯展示名，tunnelId 区分）', () => {
+    const registry = new TunnelRegistry();
+    const a = makeSession().session;
+    const b = new TunnelSession(
+      new FakeWs().asWs(), { tunnelId: 'tid-2', hostname: 'pc-a', defaultPath: '/' }, nullLogger, () => {},
+    );
+    registry.set('tid-1', a);
+    registry.set('tid-2', b);
+    expect(registry.list().map((s) => s.hostname)).toEqual(['pc-a', 'pc-a']);
+    expect(registry.get('tid-2')).toBe(b);
   });
 });

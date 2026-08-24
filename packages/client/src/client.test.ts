@@ -21,7 +21,7 @@ class MiniGateway {
         if (isBinary) return;
         const frame = decodeControl(String(data));
         this.received.push(frame);
-        if (frame.type === 'hello') ws.send(encodeControl({ type: 'hello.ack' }));
+        if (frame.type === 'hello') ws.send(encodeControl({ type: 'hello.ack', tunnelId: 'tid-mini-1' }));
         if (frame.type === 'ping') ws.send(encodeControl({ type: 'pong' }));
       });
     });

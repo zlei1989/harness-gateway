@@ -54,7 +54,7 @@ export class MockGateway {
   private onMessage(buf: Buffer, isBinary: boolean): void {
     if (!isBinary) {
       const frame = decodeControl(buf.toString('utf8'));
-      if (frame.type === 'hello') this.ws?.send(encodeControl({ type: 'hello.ack' }));
+      if (frame.type === 'hello') this.ws?.send(encodeControl({ type: 'hello.ack', tunnelId: 'tid-mock-1' }));
       else if (frame.type === 'ping') this.ws?.send(encodeControl({ type: 'pong' }));
       else if (frame.type === 'http.head') {
         const p = this.pending.get(frame.channelId);

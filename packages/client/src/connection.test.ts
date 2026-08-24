@@ -34,7 +34,7 @@ class MockGateway {
         const frame = decodeControl(String(data));
         this.received.push(frame);
         if (frame.type === 'hello' && this.helloAction === 'ack') {
-          const reply = () => ws.send(encodeControl({ type: 'hello.ack' }));
+          const reply = () => ws.send(encodeControl({ type: 'hello.ack', tunnelId: 'tid-1' }));
           if (this.ackDelayMs > 0) setTimeout(reply, this.ackDelayMs);
           else reply();
         }
@@ -83,7 +83,7 @@ function makeHandlers() {
 }
 
 describe('Connection', () => {
-  it('hello 握手：连接后首帧为 hello，收到 ack 后 ready 并 resolve', async () => {
+  it('hello 握手：连接后首帧为 hello（首连不带 tunnelId），收到 ack 后 ready 并 resolve，记下分配的 tunnelId', async () => {
     const gw = new MockGateway();
     const { handlers } = makeHandlers();
     const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
@@ -91,6 +91,7 @@ describe('Connection', () => {
     await conn.connect();
     expect(conn.ready).toBe(true);
     expect(gw.received[0]).toEqual({ type: 'hello', client: { hostname: 'pc-a', defaultPath: '/' } });
+    expect(conn.tunnelId).toBe('tid-1'); // ack 下发的 tunnelId 已记忆
     await conn.close();
     await gw.close();
   });
@@ -114,7 +115,7 @@ describe('Connection', () => {
     await gw.close();
   });
 
-  it('断线自动重连：drop 后 disconnected → 重连成功再 connected', async () => {
+  it('断线自动重连：drop 后 disconnected → 重连成功再 connected，重连 hello 回带上次 tunnelId 请求复用', async () => {
     const gw = new MockGateway();
     const { handlers, calls } = makeHandlers();
     const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
@@ -127,6 +128,10 @@ describe('Connection', () => {
     await new Promise<void>((resolve) => conn.once('connected', resolve));
     expect(events).toEqual(['connected', 'disconnected', 'connected']);
     expect(calls.disconnected).toBe(1);
+    // 第二次 hello 携带 ack 记忆的 tunnelId（服务端空闲即复用，浏览器老会话随之恢复）
+    const hellos = gw.received.filter((f) => f.type === 'hello');
+    expect(hellos).toHaveLength(2);
+    expect(hellos[1]).toEqual({ type: 'hello', client: { hostname: 'pc-a', defaultPath: '/', tunnelId: 'tid-1' } });
     await conn.close();
     await gw.close();
   });
