@@ -1,0 +1,52 @@
+{
+  "name": "dsh-remote-access",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH 插件：远程访问——经 harness-gateway 网关把当前 DSH web 暴露到公网（设置页配置 + 手动启用 + 二维码深链）",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "watch": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "format": "eslint . --fix",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "dependencies": {
+    "gateway-client": "workspace:*",
+    "qrcode-generator": "^1.4.4",
+    "ws": "^8.18.0",
+    "yaml": "^2.6.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@types/node": "^20.19.43",
+    "@types/qrcode-generator": "^1.0.6",
+    "@types/react": "^18.3.31",
+    "@types/ws": "^8.18.1",
+    "eslint": "^9",
+    "react": "^18.3.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5",
+    "typescript-eslint": "^8.61.0",
+    "vitest": "^4.1.8"
+  }
+}

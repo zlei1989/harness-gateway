@@ -1,0 +1,7 @@
+# dsh-remote-access bundle 补丁层。
+# 一行同时服务于包的两半：Loader 加载包 main（lib/index.js）为 host 插件；
+# client-modules 扫描到同一行后按 dsh.client 声明把 lib/client.js 服务到
+# /plugins/<id>/client.js。行名必须与包名完全一致。
+- insert:
+    - id: remote-access
+      name: dsh-remote-access

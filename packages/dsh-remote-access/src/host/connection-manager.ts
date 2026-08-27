@@ -1,0 +1,115 @@
+/**
+ * 隧道连接管理 — 封装 gateway-client 的 Client 生命周期与状态机。
+ * 状态：off → connecting → connected / error；disconnected 后回到
+ * connecting（Connection 内建断线重连 + tunnelId 回带复用）。
+ * enable 幂等：先关闭旧实例再新建（配置变更后重新启用）。
+ */
+
+import os from 'node:os';
+
+import { Client } from 'gateway-client';
+
+import { buildSelectDeepLink, deriveGatewayEndpoints, type GatewayEndpoints } from './gateway-url';
+
+import type { RemoteAccessConfig } from './config';
+import type { ConnectionStatusDto } from '../shared/types';
+
+export interface ConnectionManagerDeps {
+  /** 当前 DSH web 服务地址（http://127.0.0.1:<webServer.port>） */
+  upstreamUrl: string;
+}
+
+const LOG_PREFIX = '[dsh-remote-access]';
+
+export class ConnectionManager {
+  private client: Client | null = null;
+  private endpoints: GatewayEndpoints | null = null;
+  private info: ConnectionStatusDto = { state: 'off' };
+
+  constructor(private readonly deps: ConnectionManagerDeps) {}
+
+  get status(): ConnectionStatusDto {
+    return this.info;
+  }
+
+  /** 启用连接；非法配置/首连失败时状态落 error（非法输入的 Error 继续上抛给 UI）。 */
+  async enable(cfg: RemoteAccessConfig): Promise<ConnectionStatusDto> {
+    // 先校验配置：非法网关地址抛错时不改动现有状态（保持 off）
+    const endpoints = deriveGatewayEndpoints(cfg.gateway);
+    const hostname = cfg.hostname.trim() || os.hostname();
+    // enable 幂等：先关闭旧实例再新建（配置变更后重新启用）。
+    // 不复用 disable()：其同步段会把状态置 off，导致未 await enable 的
+    // 调用方观察不到 connecting；这里内联旧实例清理，同步置 connecting。
+    const old = this.client;
+    this.client = null;
+    this.info = { state: 'connecting' };
+    if (old) await old.close().catch(() => undefined);
+    // 构造器对非法配置同步抛错（client.ts 构造校验）——纳入 try/catch，
+    // 否则状态机已置 connecting 且无人回写，会永久楔死
+    let client: Client;
+    try {
+      client = new Client({
+        upstreamUrl: this.deps.upstreamUrl,
+        gatewayUrl: endpoints.gatewayUrl,
+        hostname,
+        token: cfg.token,
+        logger: {
+          debug: () => undefined,
+          info: (m) => console.info(`${LOG_PREFIX} [INFO] ${m}`),
+          warn: (m) => console.warn(`${LOG_PREFIX} [WARN] ${m}`),
+          error: (m) => console.error(`${LOG_PREFIX} [ERROR] ${m}`),
+        },
+      });
+      this.client = client;
+      this.endpoints = endpoints;
+    } catch (err) {
+      this.info = { state: 'error', error: err instanceof Error ? err.message : String(err) };
+      this.client = null;
+      return this.info;
+    }
+    console.info(`${LOG_PREFIX} [INFO] 开始连接网关: ${endpoints.gatewayUrl}（hostname=${hostname}）`);
+
+    // EventEmitter 语义：error 事件必须挂监听
+    client.on('error', (err: Error) => {
+      if (this.client === client) this.info = { state: 'error', error: err.message };
+    });
+    client.on('connected', () => {
+      if (this.client !== client) return; // 旧实例迟到事件
+      const tunnelId = client.tunnelId;
+      this.info = {
+        state: 'connected',
+        ...(tunnelId ? { tunnelId } : {}),
+        ...(tunnelId && this.endpoints
+          ? { deepLink: buildSelectDeepLink(this.endpoints.selectUrl, tunnelId) }
+          : {}),
+      };
+      console.info(`${LOG_PREFIX} [INFO] 隧道已连接: tunnelId=${tunnelId ?? '-'}`);
+    });
+    client.on('disconnected', () => {
+      // 断线重连由 Connection 内建；曾连上后的断开回到 connecting
+      if (this.client === client && this.info.state === 'connected') this.info = { state: 'connecting' };
+    });
+
+    try {
+      await client.connect();
+    } catch (err) {
+      // 并发 disable 导致的 connect 拒绝不回写状态（保持 off）
+      if (this.client === client) this.info = { state: 'error', error: err instanceof Error ? err.message : String(err) };
+      await client.close().catch(() => undefined);
+      if (this.client === client) this.client = null;
+    }
+    return this.info;
+  }
+
+  /** 关闭连接（无连接时为 no-op）。 */
+  async disable(): Promise<ConnectionStatusDto> {
+    const client = this.client;
+    this.client = null;
+    this.info = { state: 'off' };
+    if (client) {
+      await client.close().catch(() => undefined);
+      console.info(`${LOG_PREFIX} [INFO] 隧道已关闭`);
+    }
+    return this.info;
+  }
+}
