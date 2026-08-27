@@ -10,6 +10,7 @@
     "client": "pnpm --filter gateway-client start",
     "dev": "pnpm -r dev",
     "format": "pnpm -r format",
+    "proxy": "pnpm --filter gateway-proxy start",
     "server": "pnpm --filter gateway-server start",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck"

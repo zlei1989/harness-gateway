@@ -105,12 +105,14 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
       let hostname: string;
       let defaultPath: string;
       let requestedId: string | undefined;
+      let flowAck = false;
       try {
         const frame = decodeControl(buf.toString('utf8'));
         if (frame.type !== 'hello') throw new ProtocolError(`首帧非 hello: ${frame.type}`);
         hostname = frame.client.hostname;
         defaultPath = frame.client.defaultPath;
         requestedId = frame.client.tunnelId; // 重连复用回带（可缺省）
+        flowAck = frame.client.flowControl === true; // 端到端流量窗口能力声明（可缺省 = 不支持）
         if (!hostname) throw new ProtocolError('hello.hostname 为空');
       } catch (err) {
         // 仅记错误摘要（ProtocolError 消息不含帧原文，防泄 token）
@@ -120,7 +122,8 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
       }
       clearTimeout(helloTimer);
       const tunnelId = resolveTunnelId(requestedId, ctx.tunnels);
-      session = new TunnelSession(ws, { tunnelId, hostname, defaultPath }, ctx.logger, (s) => {
+      const info = { tunnelId, hostname, defaultPath, flowAck };
+      session = new TunnelSession(ws, info, ctx.logger, (s) => {
         ctx.tunnels.delete(s.tunnelId, s); // 身份校验防重连竞态
         ctx.logger.info('隧道断开', { hostname: s.hostname, tunnelId: s.tunnelId });
       });
@@ -134,6 +137,7 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
       if (isBinary) {
         const { header, payload } = decodeData(buf);
         consecutiveBadFrames = 0; // 成功解码即重置连续坏帧计数
+        session.noteDataReceived(buf.length); // tunnel.ack 流量回执记账（含帧头，与客户端发送记账同口径）
         session.handleData(header, payload);
       } else {
         const frame = decodeControl(buf.toString('utf8'));

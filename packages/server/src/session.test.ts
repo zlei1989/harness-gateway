@@ -6,7 +6,7 @@
 
 import { EventEmitter } from 'node:events';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { type PendingChannel, TunnelRegistry, TunnelSession } from './session';
 
@@ -81,6 +81,38 @@ describe('TunnelSession', () => {
     const { session, ws } = makeSession();
     session.handleControl({ type: 'ping' });
     expect(String(ws.sent[0])).toBe(JSON.stringify({ type: 'pong' }));
+  });
+
+  it('tunnel.ack 流量回执：声明 flowControl 后按 128KiB 节拍回累计字节；未声明不回执', () => {
+    // 未声明 flowControl（老客户端）：任何数据量都不回执（防未知帧坏帧预算误杀对端）
+    const { session, ws } = makeSession();
+    session.noteDataReceived(200 * 1024);
+    expect(ws.sent).toHaveLength(0);
+    // 声明后：按 ACK_EVERY_BYTES(128KiB) 节拍回执累计字节数（含帧头口径，由 tunnel.ts 记账）
+    const ws2 = new FakeWs();
+    const s2 = new TunnelSession(
+      ws2.asWs(), { tunnelId: 't-2', hostname: 'pc-b', defaultPath: '/', flowAck: true }, nullLogger, () => {},
+    );
+    s2.noteDataReceived(100 * 1024); // 不足 128KiB：不回
+    expect(ws2.sent).toHaveLength(0);
+    s2.noteDataReceived(50 * 1024); // 累计 150KiB ≥ 128KiB：回执累计值
+    expect(ws2.sent).toHaveLength(1);
+    expect(JSON.parse(String(ws2.sent[0]))).toEqual({ type: 'tunnel.ack', bytes: 150 * 1024 });
+    s2.noteDataReceived(200 * 1024); // 距上次回执 200KiB ≥ 128KiB：再次回执
+    expect(ws2.sent).toHaveLength(2);
+    expect(JSON.parse(String(ws2.sent[1]))).toEqual({ type: 'tunnel.ack', bytes: 350 * 1024 });
+  });
+
+  it('tunnel.ack 兜底回执：不足 128KiB 的尾数在 1s 内补回（防客户端流量窗口滞回死锁）', async () => {
+    const ws = new FakeWs();
+    const s = new TunnelSession(
+      ws.asWs(), { tunnelId: 't-3', hostname: 'pc-c', defaultPath: '/', flowAck: true }, nullLogger, () => {},
+    );
+    s.noteDataReceived(64 * 1024); // 不足节拍：不立即回执
+    expect(ws.sent).toHaveLength(0);
+    await vi.waitFor(() => { expect(ws.sent).toHaveLength(1); }, { timeout: 3000 }); // 兜底定时器补回
+    expect(JSON.parse(String(ws.sent[0]))).toEqual({ type: 'tunnel.ack', bytes: 64 * 1024 });
+    s.teardown();
   });
 
   it('teardown：全部通道 onTunnelDown + 触发 onDown 回调', () => {

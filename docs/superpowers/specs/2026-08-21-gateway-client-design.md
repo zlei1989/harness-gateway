@@ -70,7 +70,7 @@ import { Client } from 'gateway-client'
 
 const client = new Client({
   upstreamUrl: 'https://localhost:3080',  // 应用服务地址
-  gatewayUrl: 'ws://server:3081/tunnel',  // 网关隧道端点
+  gatewayUrl: 'ws://server:9000/tunnel',  // 网关隧道端点
   hostname: 'pc-a',                       // 必填：选择页展示名（可重复；路由身份由服务端分配的 tunnelId 承担）
   token: 'secret-token',                  // 可选：本机接入令牌（见 §3.1 默认鉴权）
   defaultPath: '/',                       // 可选：用户选择成功后浏览器跳转路径（默认 '/'）
@@ -108,7 +108,7 @@ Express 中间件风格在隧道场景的精确适配：
 
 - `connect()`：发起连接，首次隧道就绪（收到 `hello.ack`）后 resolve。失败按 §6 重连循环继续、不 reject；超过 `connectTimeoutMs`（默认 60s）仍未就绪则 reject。收到 4409 立即 reject 且**不再重连**（旧版服务端 hostname 冲突码；现行服务端同名并存不会发出，本分支为兼容保留）
 - `close()`：停心跳与重连 → 拒收新 open 帧 → **关闭隧道 WS**（服务端随即注销 hostname，后续请求 502）→ 中止在途通道并释放资源（可配超时强制关闭）→ 销毁 upstream keep-alive 连接池（空闲 socket 不泄漏到 Client 生命周期之外）
-- **upstream 连接复用**：Client 持有一个与 upstream 协议对应的显式 keep-alive Agent（`keepAlive: true, keepAliveMsecs: 1000`），所有 HTTP 通道共用——高 RTT 链路下每条新建 TCP 都是一次完整握手往返，连接池把 upstream 侧连接成本降为"首次一次"；Agent 随 `close()` 销毁，重连期间连接池保持温热（不随隧道断开重置）
+- **upstream 连接复用**：Client 持有一个与 upstream 协议对应的显式 keep-alive Agent（`keepAlive: true, keepAliveMsecs: 1000, timeout: 4000`），所有 HTTP 通道共用——高 RTT 链路下每条新建 TCP 都是一次完整握手往返，连接池把 upstream 侧连接成本降为"首次一次"；`timeout: 4000` 让空闲池内 socket 先于 upstream（Node 默认 keepAliveTimeout 5s）自毁，从源头减少陈旧连接复用竞态（2026-08-27 补记，一次性重试兜底见 §5.1）；Agent 随 `close()` 销毁，重连期间连接池保持温热（不随隧道断开重置）
 - 事件：`client.on('connected' | 'disconnected' | 'error', …)`；**必须挂 `error` 监听**（EventEmitter 语义：无监听时 error 事件会抛异常）
 
 ## 4. 隧道帧协议（v1）
@@ -119,8 +119,9 @@ Express 中间件风格在隧道场景的精确适配：
 
 | 方向 | type | 载荷 | 用途 |
 |------|------|------|------|
-| 客户端→网关 | `hello` | `{client:{hostname, defaultPath, tunnelId?}}` | 连接建立后首帧发送（**不含 token**）；收到 `hello.ack` 才算隧道就绪；`tunnelId` 仅重连时回带上次分到的 id 请求复用 |
+| 客户端→网关 | `hello` | `{client:{hostname, defaultPath, tunnelId?, flowControl?}}` | 连接建立后首帧发送（**不含 token**）；收到 `hello.ack` 才算隧道就绪；`tunnelId` 仅重连时回带上次分到的 id 请求复用；`flowControl: true` 声明支持 `tunnel.ack` 端到端流量窗口（§4.4） |
 | 网关→客户端 | `hello.ack` | `{tunnelId}` | 隧道就绪确认，携带服务端决定的 tunnelId（回带空闲则复用，否则新分配 uuid）；旧版服务端 hostname 冲突时改为 WS 关闭码 4409（客户端视为进程级错误：connect() reject、**不重连**） |
+| 网关→客户端 | `tunnel.ack` | `{bytes}` | 端到端流量回执（§4.4）：服务端收到数据帧累计达 128KiB 回一次累计字节数；仅在客户端 hello 声明 `flowControl` 后发送（老客户端未声明不发——未知帧会消耗其坏帧预算） |
 | 网关→客户端 | `http.open` | `{channelId, method, url, headers}` | 新 HTTP 请求；headers 含服务端注入的 `X-Forwarded-For`（浏览器真实 IP） |
 | 网关→客户端 | `ws.open` | `{channelId, url, headers, protocols}` | 新 WS 握手；headers 同样含 `X-Forwarded-For` |
 | 双向 | `channel.close` | `{channelId, code?, reason?}` | 网关→客户端：对端关闭/取消；客户端→网关：upstream 主动关闭/中止 |
@@ -144,9 +145,17 @@ Express 中间件风格在隧道场景的精确适配：
 
 ### 4.3 已知边界（v1 明确不做）
 
-- **逐通道背压**：多路复用共享一条 TCP 流，v1 只尊重整体 WS 连接的 `bufferedAmount`；单通道洪峰会挤占其他通道
+- **逐通道背压**：多路复用共享一条 TCP 流，v1 只尊重整体 WS 连接的 `bufferedAmount` + 端到端在途窗口（§4.4）；单通道洪峰会挤占其他通道
 - **通道迁移**：重连后在途通道不可迁移（见 §6）
 - **逐消息鉴权**：WS 握手后的消息不鉴权（见 §3.1）
+
+### 4.4 端到端流量窗口（tunnel.ack，2026-08-27 线上断连根因补记）
+
+- **问题**：`ws.bufferedAmount` 只度量本机队列；内核 TCP 缓冲与中间盒（限流代理等）的缓冲对应用不可见——大流量时限流链路的"在途数据"可达数 MiB，ping/pong 与数据帧共享同一条 WS 发送 FIFO，心跳帧合法地排队于数据之后，往返远超 90s 判死窗，"静默判死"误杀健康隧道（高并发/大文件/长连接下客户端反复断开、浏览器会话失效）。
+- **机制**：客户端 hello 声明 `flowControl: true`；服务端按收到数据帧的累计字节（含帧头，与发送侧记账同口径）每 128KiB 回 `{type:'tunnel.ack', bytes}`；客户端以 `dataBytesSent - dataBytesAcked` 度量**端到端在途量**，超 2MiB 高窗口即暂停生产（`sendData` 返回 false），ack 推进到 512KiB 低窗口内唤醒恢复（与本地水位滞回同构）。
+- **双重作用**：① 把在途数据钳制在窗口内（真实端到端背压，中间盒/内核不再无界吸纳）；② 下载方向（客户端→服务端数据、反向静默）ack 每 ~128KiB 规律到达，为心跳提供入站活性——50KB/s 链路下 ack 间隔 ≈2.6s ≪ 90s 判死窗。
+- **兼容**：老服务端忽略 hello 的 flowControl 字段、不回 ack——客户端收到首个 `tunnel.ack` 前窗口不生效（回退本地水位背压）；老客户端不声明 flowControl，服务端不回执（未知帧会消耗坏帧预算）。
+- **窗口取值**：2MiB 高窗口保证最劣 50KB/s 链路下 ack 往返 ≈40s < 90s 判死窗；高吞吐链路 2MiB 在途亦足以吃满带宽时延积。
 
 ## 5. 转发流程
 
@@ -167,7 +176,7 @@ Express 中间件风格在隧道场景的精确适配：
               upstream 不可达/超时 ──► http.head(502) + 错误说明 + 结束
 ```
 
-已确认细节：**Host 头重写为 upstream 主机**（不透传浏览器原始 Host）；**Origin 头同步重写为 upstream origin**（2026-08-23 线上事故补记：浏览器 Origin 描述的是浏览器↔网关的关系，原样透传会被上游同源/反 DNS 重绑定围栏以 Origin.host ≠ Host.host 拒绝——DSH `/api/*` 一律 403；浏览器未携带 Origin 时不伪造。WS 握手浏览器同样携带 Origin，ws 通道同一规则）。
+已确认细节：**Host 头重写为 upstream 主机**（不透传浏览器原始 Host）；**Origin 头同步重写为 upstream origin**（2026-08-23 线上事故补记：浏览器 Origin 描述的是浏览器↔网关的关系，原样透传会被上游同源/反 DNS 重绑定围栏以 Origin.host ≠ Host.host 拒绝——DSH `/api/*` 一律 403；浏览器未携带 Origin 时不伪造。WS 握手浏览器同样携带 Origin，ws 通道同一规则）。**陈旧 keep-alive 连接一次性重试**（2026-08-27 线上 502 根因补记）：限流链路把请求间隔拉长到秒级后，Agent 复用的空闲 socket 可能已被 upstream 关闭（复用即 ECONNRESET/socket hang up）；幂等方法（GET/HEAD/OPTIONS/DELETE）且响应头未收到、请求体未写入时自动换新连接重试一次（带 body 的请求不重试，防重复体）。
 
 ### 5.2 WS 通道
 
@@ -190,7 +199,7 @@ Express 中间件风格在隧道场景的精确适配：
 
 - **自动重连**：指数退避 1s → 30s 封顶 + 随机抖动，默认无限重试（`reconnect.maxRetries` 可配）
 - **重连语义**：重连成功是全新会话，旧 `channelId` 全部作废；在途通道本地失败销毁——**502 由服务端在隧道断开时统一回给浏览器，客户端无需也无法补发**。**通道不可迁移**（隧道类系统常规取舍，已确认）。**tunnelId 复用**：客户端进程内存记住最近一次 `hello.ack` 的 tunnelId，重连时经 `hello` 回带——服务端确认空闲即复用（浏览器老会话恢复），被占用则分新 id（以 ack 为准更新本地记忆）；进程重启即遗忘（新 id 新会话）
-- **心跳**：每 30s 发应用层 `ping` 控制帧；连续 3 个周期（90s）无任何入站消息判定死连接，主动断开走重连
+- **心跳**：每 30s 发应用层 `ping` 控制帧；连续 3 个周期（90s）无任何入站消息判定死连接，主动断开走重连。大流量下的入站活性由 `tunnel.ack` 兜底（§4.4：下载方向反向链路本无流量，ack 随数据帧接收进度规律回执），"静默"重新等价于"真死"，无需对拥塞做启发式豁免（2026-08-27 线上断连根因补记）
 - **优雅关闭**（`close()`）：停心跳、拒收新 open 帧、关闭隧道 WS、中止在途通道（可配超时强制关闭）——服务端在隧道关闭时即注销 hostname，不存在"排空间隙继续路由"的竞态
 
 ## 7. 错误处理分级

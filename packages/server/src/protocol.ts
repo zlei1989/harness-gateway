@@ -8,8 +8,14 @@ export type HeadersJson = Record<string, string | string[]>;
 
 // ---- 控制帧 ----
 
-export interface HelloFrame { type: 'hello'; client: { hostname: string; defaultPath: string; tunnelId?: string } }
+export interface HelloFrame { type: 'hello'; client: { hostname: string; defaultPath: string; tunnelId?: string; flowControl?: boolean } }
 export interface HelloAckFrame { type: 'hello.ack'; tunnelId: string }
+/**
+ * 隧道级流量确认（端到端背压 + 存活心跳载体）：服务端按收到数据帧的累计字节数定期回执，
+ * 客户端据此把在途数据钳制在窗口内（内核/中间盒缓冲对应用不可见，本地 bufferedAmount 无法度量端到端在途量），
+ * 且下载方向（客户端→服务端数据、服务端→客户端静默）为客户端提供规律的入站活性，心跳判死不再被拥塞蒙蔽
+ */
+export interface TunnelAckFrame { type: 'tunnel.ack'; bytes: number }
 export interface HttpOpenFrame { type: 'http.open'; channelId: number; method: string; url: string; headers: HeadersJson }
 export interface WsOpenFrame { type: 'ws.open'; channelId: number; url: string; headers: HeadersJson; protocols: string[] }
 /** 双向：网关→客户端 = 浏览器侧关闭/取消；客户端→网关 = upstream 主动关闭/中止 */
@@ -24,7 +30,8 @@ export interface PongFrame { type: 'pong' }
 
 export type ControlFrame =
   | HelloFrame | HelloAckFrame | HttpOpenFrame | WsOpenFrame | ChannelCloseFrame
-  | HttpHeadFrame | WsAcceptFrame | WsRejectFrame | ChannelErrorFrame | PingFrame | PongFrame;
+  | HttpHeadFrame | WsAcceptFrame | WsRejectFrame | ChannelErrorFrame | PingFrame | PongFrame
+  | TunnelAckFrame;
 
 /** 协议错误（坏帧、未知 type）：调用方按坏帧预算降级——单帧 WARN + 丢弃，连续超预算才断开（spec §8 帧级） */
 export class ProtocolError extends Error {
@@ -37,6 +44,7 @@ export class ProtocolError extends Error {
 const CONTROL_TYPES = new Set([
   'hello', 'hello.ack', 'http.open', 'ws.open', 'channel.close',
   'http.head', 'ws.accept', 'ws.reject', 'channel.error', 'ping', 'pong',
+  'tunnel.ack',
 ]);
 
 /** 编码控制帧为 JSON 文本帧 */

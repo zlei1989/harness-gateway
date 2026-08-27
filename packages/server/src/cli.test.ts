@@ -8,9 +8,9 @@ import { describe, expect, it } from 'vitest';
 import { main, parseArgs } from './cli';
 
 describe('parseArgs', () => {
-  it('默认 port 3081，压缩与 keep-alive 默认关闭/未设', () => {
+  it('默认 port 9000，压缩与 keep-alive 默认关闭/未设', () => {
     const args = parseArgs([]);
-    expect(args.port).toBe(3081);
+    expect(args.port).toBe(9000);
     expect(args.tunnelPerMessageDeflate).toBe(false);
     expect(args.keepAliveTimeoutMs).toBeUndefined();
   });

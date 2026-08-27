@@ -20,6 +20,8 @@ class MockGateway {
   helloAction: 'ack' | 'close4409' | 'ignore' = 'ack';
   /** 测试旋钮：hello.ack 延迟毫秒数（0 = 立即），用于构造"迟到的 ack"竞态 */
   ackDelayMs = 0;
+  /** 测试旋钮：是否应答 ping（false = 模拟对端永不回 pong 的静默链路） */
+  answerPings = true;
 
   constructor() {
     this.wss.on('connection', (ws) => {
@@ -39,7 +41,7 @@ class MockGateway {
           else reply();
         }
         if (frame.type === 'hello' && this.helloAction === 'close4409') ws.close(4409, 'hostname conflict');
-        if (frame.type === 'ping') ws.send(encodeControl({ type: 'pong' }));
+        if (frame.type === 'ping' && this.answerPings) ws.send(encodeControl({ type: 'pong' }));
       });
     });
   }
@@ -90,7 +92,7 @@ describe('Connection', () => {
     conn.on('error', () => {});
     await conn.connect();
     expect(conn.ready).toBe(true);
-    expect(gw.received[0]).toEqual({ type: 'hello', client: { hostname: 'pc-a', defaultPath: '/' } });
+    expect(gw.received[0]).toEqual({ type: 'hello', client: { hostname: 'pc-a', defaultPath: '/', flowControl: true } });
     expect(conn.tunnelId).toBe('tid-1'); // ack 下发的 tunnelId 已记忆
     await conn.close();
     await gw.close();
@@ -131,7 +133,7 @@ describe('Connection', () => {
     // 第二次 hello 携带 ack 记忆的 tunnelId（服务端空闲即复用，浏览器老会话随之恢复）
     const hellos = gw.received.filter((f) => f.type === 'hello');
     expect(hellos).toHaveLength(2);
-    expect(hellos[1]).toEqual({ type: 'hello', client: { hostname: 'pc-a', defaultPath: '/', tunnelId: 'tid-1' } });
+    expect(hellos[1]).toEqual({ type: 'hello', client: { hostname: 'pc-a', defaultPath: '/', flowControl: true, tunnelId: 'tid-1' } });
     await conn.close();
     await gw.close();
   });
@@ -172,6 +174,24 @@ describe('Connection', () => {
     gw.sockets[0]?.pause();
     await new Promise<void>((resolve) => conn.once('connected', resolve)); // 重连成功
     expect(conn.ready).toBe(true);
+    await conn.close();
+    await gw.close();
+  });
+
+  // 对端彻底静默（不回 pong）即使出站仍有积压也必须判死——防"拥塞豁免"过度矫正成永不判死
+  it('心跳判死：对端静默且出站缓冲积压停滞 → 判死断开重连', async () => {
+    const gw = new MockGateway();
+    gw.answerPings = false;
+    const { handlers } = makeHandlers();
+    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
+    conn.on('error', () => {});
+    await conn.connect();
+    // 网关暂停读取后垫 4MiB：内核缓冲吸满后出站积压，且永无 pong（静默）
+    gw.sockets[0]?.pause();
+    conn.sendData({ channelId: 999, kind: 'http.body' }, Buffer.alloc(4 * 1024 * 1024));
+    await new Promise<void>((resolve) => conn.once('connected', resolve)); // 判死后重连成功
+    expect(conn.ready).toBe(true);
+    gw.sockets.forEach((ws) => ws.resume()); // 放行 close 握手，避免 5s 强制 terminate 等待
     await conn.close();
     await gw.close();
   });
@@ -400,6 +420,84 @@ describe('Connection', () => {
     expect(closeCode).toBeNull();
     expect(calls.disconnected).toBe(0);
     expect(calls.control.some((f) => f.type === 'channel.error')).toBe(true); // 好帧已路由
+    await conn.close();
+    await gw.close();
+  });
+});
+
+// 端到端流量窗口（tunnel.ack）：在途量超窗暂停生产、ack 推进恢复、老服务端无 ack 回退本地水位
+describe('tunnel.ack 端到端流量窗口', () => {
+  /** 造 3MiB 数据帧把在途量顶过 2MiB 高窗口（单帧 < 100MiB 上限） */
+  const bigPayload = (): Buffer => Buffer.alloc(3 * 1024 * 1024);
+
+  it('收到 tunnel.ack 前（老服务端）：sendData 不受流量窗口限制，ack 帧不上抛通道层', async () => {
+    const gw = new MockGateway();
+    const { handlers, calls } = makeHandlers();
+    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
+    conn.on('error', () => {});
+    await conn.connect();
+    // 老服务端不回 ack：3MiB 在途也不触发流量窗口（仅本地水位生效，localhost 下不触发）
+    expect(conn.sendData({ channelId: 1, kind: 'http.body' }, bigPayload())).toBe(true);
+    gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: 0 })); // ack 帧由连接层消化
+    await new Promise((r) => setTimeout(r, 100));
+    expect(calls.control).toHaveLength(0); // tunnel.ack 不上抛
+    await conn.close();
+    await gw.close();
+  });
+
+  it('激活后在途量超窗口 → sendData 返回 false；ack 推进到滞回线内 → waitDrain 唤醒', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
+    conn.on('error', () => {});
+    await conn.connect();
+    // 激活流量窗口（等价服务端已回执 0 字节起步）；无速率样本时按最小窗口 256KiB
+    gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: 0 }));
+    await new Promise((r) => setTimeout(r, 50));
+    // 在途 3MiB > 256KiB 最小窗口 → 背压
+    expect(conn.sendData({ channelId: 1, kind: 'http.body' }, bigPayload())).toBe(false);
+    // ack 未推进：waitDrain 不得唤醒（轮询确认在途量仍在滞回线之上）
+    let drained = false;
+    void conn.waitDrain().then(() => { drained = true; });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(drained).toBe(false);
+    // ack 推进到在途量归零（≤ 窗口 1/4 滞回线）→ 唤醒恢复生产
+    const frameLen = 3 * 1024 * 1024 + 4 + JSON.stringify({ channelId: 1, kind: 'http.body' }).length;
+    gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: frameLen }));
+    await vi.waitFor(() => { expect(drained).toBe(true); });
+    await conn.close();
+    await gw.close();
+  });
+
+  it('窗口随 ack 实测速率自适应放宽：快链路下在途量超限最小窗口也不背压', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
+    conn.on('error', () => {});
+    await conn.connect();
+    // 两次推进 1MiB、间隔 ~100ms → 实测速率 ≈10MiB/s → 窗口放宽到 4MiB 上限
+    gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: 0 }));
+    await new Promise((r) => setTimeout(r, 100));
+    gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: 1024 * 1024 }));
+    await new Promise((r) => setTimeout(r, 50));
+    // 在途 3MiB：超最小窗口 256KiB 但低于自适应窗口 4MiB → 不背压
+    expect(conn.sendData({ channelId: 1, kind: 'http.body' }, bigPayload())).toBe(true);
+    await conn.close();
+    await gw.close();
+  });
+
+  it('ack 字节数单调取大：乱序/回退的 ack 不得抬高水位口径', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
+    conn.on('error', () => {});
+    await conn.connect();
+    gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: 10 * 1024 * 1024 }));
+    await new Promise((r) => setTimeout(r, 50));
+    gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: 1024 })); // 回退值：必须忽略
+    await new Promise((r) => setTimeout(r, 50));
+    // ack 口径仍是 10MiB：3MiB 在途 - 10MiB ack < 0 → 不超窗
+    expect(conn.sendData({ channelId: 1, kind: 'http.body' }, bigPayload())).toBe(true);
     await conn.close();
     await gw.close();
   });

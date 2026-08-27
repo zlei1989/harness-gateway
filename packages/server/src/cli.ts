@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * harness-server CLI — 纯参数启动网关（服务端无函数型选项，不需要配置文件，spec §1.3-1）。
- * 用法：harness-server [--port 3081] [--tunnel-path <path>] [--select-path <path>]（spec §1.3-1 纯参数）
+ * 用法：harness-server [--port 9000] [--tunnel-path <path>] [--select-path <path>]（spec §1.3-1 纯参数）
  * 注意：由 bin/harness-server.mjs 以 tsx 启动；main() 返回退出码便于测试。
  * 安全红线：所有错误路径只输出单行诊断（err.message 首行），不打印原始 Error 对象/堆栈，
  * 避免回显可能含敏感信息的代码帧（对齐客户端已审定 CLI 的安全修复语义）。
@@ -23,7 +23,7 @@ export interface CliArgs {
   help: boolean;
 }
 
-const USAGE = '用法: harness-server [--port <3081>] [--tunnel-path <path>] [--select-path <path>] '
+const USAGE = '用法: harness-server [--port <9000>] [--tunnel-path <path>] [--select-path <path>] '
   + '[--tunnel-permessage-deflate] [--keep-alive-timeout-ms <ms>]\n'
   + '环境变量: HARNESS_CORS_ORIGINS —— 逗号分隔的 CORS 允许名单（默认 *.7qbjs.com,*.jd.com,localhost,127.0.0.1；* 全放行）';
 
@@ -34,7 +34,7 @@ function singleLine(err: unknown): string {
 
 /** 解析 CLI 参数；非法值抛错 */
 export function parseArgs(argv: string[]): CliArgs {
-  let port = 3081;
+  let port = 9000;
   let tunnelPath: string | undefined;
   let selectPath: string | undefined;
   let tunnelPerMessageDeflate = false;

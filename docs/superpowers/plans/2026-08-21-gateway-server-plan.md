@@ -2147,7 +2147,7 @@ git commit -m "feat: gateway-server GatewayServer 主类与单端口流量分发
 **Interfaces:**
 - Consumes: `GatewayServer`（Task 8）
 - Produces:
-  - `parseArgs(argv: string[]): { port: number; tunnelPath?: string | undefined; selectPath?: string | undefined; help: boolean }`（`--port` 默认 3081）
+  - `parseArgs(argv: string[]): { port: number; tunnelPath?: string | undefined; selectPath?: string | undefined; help: boolean }`（`--port` 默认 9000）
   - `main(argv: string[]): Promise<number>`
 
 - [ ] **Step 1: 写失败的测试**
@@ -2159,8 +2159,8 @@ import { describe, expect, it } from 'vitest';
 import { main, parseArgs } from './cli';
 
 describe('parseArgs', () => {
-  it('默认 port 3081', () => {
-    expect(parseArgs([]).port).toBe(3081);
+  it('默认 port 9000', () => {
+    expect(parseArgs([]).port).toBe(9000);
   });
   it('--port / --tunnel-path / --select-path', () => {
     const args = parseArgs(['--port', '9090', '--tunnel-path', '/t', '--select-path', '/s']);
@@ -2198,7 +2198,7 @@ Expected: FAIL（模块不存在）
 #!/usr/bin/env node
 /**
  * harness-server CLI — 纯参数启动网关（服务端无函数型选项，不需要配置文件，spec §1.3-1）。
- * 用法：harness-server [--port 3081] [--tunnel-path /__gateway__/tunnel] [--select-path /__gateway__/select]
+ * 用法：harness-server [--port 9000] [--tunnel-path /__gateway__/tunnel] [--select-path /__gateway__/select]
  * 注意：由 bin/harness-server.mjs 以 tsx 启动；main() 返回退出码便于测试。
  */
 
@@ -2212,11 +2212,11 @@ export interface CliArgs {
   help: boolean;
 }
 
-const USAGE = '用法: harness-server [--port <3081>] [--tunnel-path <path>] [--select-path <path>]';
+const USAGE = '用法: harness-server [--port <9000>] [--tunnel-path <path>] [--select-path <path>]';
 
 /** 解析 CLI 参数；非法值抛错 */
 export function parseArgs(argv: string[]): CliArgs {
-  let port = 3081;
+  let port = 9000;
   let tunnelPath: string | undefined;
   let selectPath: string | undefined;
   let help = false;

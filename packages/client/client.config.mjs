@@ -7,7 +7,8 @@ export default {
   // 本机要暴露的服务地址（http/https），默认指向本地 DSH Web
   upstreamUrl: 'http://localhost:3088',
   // 网关隧道端点（ws/wss），本地开发对应 `pnpm server` 默认端口 9000
-  gatewayUrl: 'ws://harness-gateway.7qbjs.com/__gateway__/tunnel',
+  gatewayUrl: 'ws://localhost:9080/__gateway__/tunnel',
+  // gatewayUrl: 'ws://harness-gateway.7qbjs.com/__gateway__/tunnel',
   // gatewayUrl: 'ws://localhost:9000/__gateway__/tunnel',
   // 选择页展示名与路由标识，全网关内唯一
   hostname: '工位001',

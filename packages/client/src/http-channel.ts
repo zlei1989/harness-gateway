@@ -9,7 +9,7 @@ import http from 'node:http';
 import https from 'node:https';
 
 import { type AuthDecision, type AuthRequest, buildAuthRequest } from './authorize';
-import { type ChannelCloseFrame, type HttpOpenFrame, normalizeHeaders, stripHopByHop } from './protocol';
+import { type ChannelCloseFrame, type HeadersJson, type HttpOpenFrame, normalizeHeaders, stripHopByHop } from './protocol';
 
 import type { Connection } from './connection';
 import type { Logger } from './logger';
@@ -34,9 +34,17 @@ export class HttpChannel {
   private req: http.ClientRequest | null = null;
   /** upstream 请求建立前到达的 body 暂存；建立后置 null 直写 */
   private pending: Buffer[] | null = [];
-  private pendingEnd = false;
+  /** 网关侧 body 已收尾（空体规则：必有此帧）；重试发新请求时据此补 end */
+  private bodyEnded = false;
   private headSent = false;
   private finished = false;
+  /** 陈旧 keep-alive 连接重试 latch：每通道至多重试一次（防循环） */
+  private retried = false;
+  /** 已写入 upstream 的 body 字节数：>0 说明请求体已被旧连接消费，重试会产生重复体，禁止重试 */
+  private bodyBytesWritten = 0;
+  /** 发起 upstream 请求的目标与加工后的 headers（陈旧连接重试时复用，start 阶段准备一次） */
+  private preparedTarget: URL | null = null;
+  private preparedHeaders: HeadersJson | null = null;
 
   constructor(private readonly params: HttpChannelParams) {}
 
@@ -90,7 +98,20 @@ export class HttpChannel {
     // 浏览器↔网关的关系，Host 已重写为 upstream，原样透传 Origin 会被上游同源/反 DNS 重绑定
     // 围栏（Origin.host !== Host.host 即拒绝）挡下；缺失不伪造（无 Origin 的读请求围栏本就放行）。
     if (headers['origin'] !== undefined) headers['origin'] = upstream.origin;
+    this.preparedTarget = target;
+    this.preparedHeaders = headers;
 
+    this.openUpstream(target, headers);
+  }
+
+  /**
+   * 发起 upstream 请求并接线（含陈旧 keep-alive 连接的一次性重试）：
+   * 经限流链路时请求间隔常被拉长到秒级，upstream 侧空闲 keep-alive socket 已被对端关闭，
+   * Agent 复用即 ECONNRESET（"socket hang up"）；对幂等方法重试一次换新连接，
+   * 否则插件/静态资源加载会间歇 502（生产页面加载失败根因）。
+   */
+  private openUpstream(target: URL, headers: HeadersJson): void {
+    const { open } = this.params;
     const mod = target.protocol === 'https:' ? https : http;
     // Agent 实例协议与 target 一致（Client 按 upstream 协议创建，SSRF 护栏保证 target 与 upstream 同 origin）；
     // 统一注解为 https.Agent：它是 http.Agent 子类，可同时满足 http/https 两分支的 request 参数类型
@@ -103,22 +124,28 @@ export class HttpChannel {
     // flush 暂存的 body 帧
     const pending = this.pending;
     this.pending = null;
-    for (const chunk of pending ?? []) req.write(chunk);
-    if (this.pendingEnd) req.end();
+    for (const chunk of pending ?? []) {
+      this.bodyBytesWritten += chunk.length;
+      req.write(chunk);
+    }
+    if (this.bodyEnded) req.end();
   }
 
   /** 网关侧请求体帧：upstream 未就绪先排队 */
   onBody(payload: Buffer): void {
     if (this.finished) return;
     if (this.pending) this.pending.push(payload);
-    else this.req?.write(payload);
+    else {
+      this.bodyBytesWritten += payload.length;
+      this.req?.write(payload);
+    }
   }
 
   /** 网关侧请求体收尾（空体规则：必有此帧） */
   onBodyEnd(): void {
     if (this.finished) return;
-    if (this.pending) this.pendingEnd = true;
-    else this.req?.end();
+    this.bodyEnded = true; // 陈旧连接重试发新请求时据此补 end
+    if (!this.pending) this.req?.end();
   }
 
   /** 网关侧取消（浏览器断开等） */
@@ -159,9 +186,19 @@ export class HttpChannel {
     res.on('error', (err) => this.fail(`upstream 响应流错误: ${err.message}`));
   }
 
-  /** upstream 请求错误：未回响应头 → 502；已回 → 通道级错误帧 */
-  private onUpstreamError(err: Error): void {
+  /** upstream 请求错误：陈旧 keep-alive 连接按一次性重试换新；未回响应头 → 502；已回 → 通道级错误帧 */
+  private onUpstreamError(err: Error & { code?: string }): void {
     if (this.finished) return;
+    // 陈旧连接判定：响应头未收到且请求体未消费（重试无重复体风险）且方法幂等
+    const staleSocket = err.code === 'ECONNRESET' || err.code === 'EPIPE' || err.message.includes('socket hang up');
+    const idempotent = ['GET', 'HEAD', 'OPTIONS', 'DELETE'].includes(this.params.open.method.toUpperCase());
+    if (staleSocket && idempotent && !this.headSent && this.bodyBytesWritten === 0 && !this.retried
+      && this.preparedTarget !== null && this.preparedHeaders !== null) {
+      this.retried = true;
+      this.params.logger.warn('upstream 陈旧连接（keep-alive 复用竞态），换新连接重试一次', { channelId: this.params.id, error: err.message });
+      this.openUpstream(this.preparedTarget, this.preparedHeaders);
+      return;
+    }
     if (!this.headSent) {
       // err.message 含内网地址/端口等细节：只进日志（WARN，不含 token），不回显给浏览器侧
       this.params.logger.warn('upstream 不可达', { channelId: this.params.id, error: err.message });

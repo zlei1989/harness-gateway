@@ -70,10 +70,13 @@ export class Client extends EventEmitter {
       throw new Error('ClientOptions.upstreamUrl 必须是 http/https');
     }
     // 显式 Agent（Node 20+ 全局 Agent 虽默认 keep-alive，但为全局共享且无人销毁）：
-    // 独立连接池可随 Client 生命周期收走，不与其他组件互相干扰
+    // 独立连接池可随 Client 生命周期收走，不与其他组件互相干扰。
+    // timeout 4000：空闲池内 socket 4s 自毁——先于 upstream（Node 默认 keepAliveTimeout 5s）
+    // 关闭，从源头减少"复用到已被对端关闭的陈旧 socket"竞态（http-channel 的一次性重试兜底残余）；
+    // 在途请求不受此 timeout 影响（仅触发 ClientRequest 'timeout' 事件，不销毁，已实测 Node 26）
     this.agent = this.upstream.protocol === 'https:'
-      ? new https.Agent({ keepAlive: true, keepAliveMsecs: 1000 })
-      : new http.Agent({ keepAlive: true, keepAliveMsecs: 1000 });
+      ? new https.Agent({ keepAlive: true, keepAliveMsecs: 1000, timeout: 4000 })
+      : new http.Agent({ keepAlive: true, keepAliveMsecs: 1000, timeout: 4000 });
     const gateway = new URL(options.gatewayUrl);
     if (gateway.protocol !== 'ws:' && gateway.protocol !== 'wss:') {
       throw new Error('ClientOptions.gatewayUrl 必须是 ws/wss');

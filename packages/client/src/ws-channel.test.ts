@@ -124,7 +124,7 @@ describe('WsChannel', () => {
     const conn = new FakeConnection();
     const ch = new WsChannel({
       id: 1,
-      open: makeOpen({ headers: { origin: 'http://pc-local:3081' } }),
+      open: makeOpen({ headers: { origin: 'http://pc-local:9000' } }),
       upstream: up.url,
       connection: conn.asConnection(), authorize: ALLOW, logger: nullLogger,
       onDone: () => {},

@@ -30,7 +30,7 @@ pnpm install
 ### 2. 启动网关服务端（公网/中心服务器上）
 
 ```bash
-pnpm run server --port 3081   # 省略 --port 时默认 3081
+pnpm run server --port 9000   # 省略 --port 时默认 9000
 ```
 
 > 注意：`pnpm server` 与 pnpm 内置 store server 命令重名，必须写作 `pnpm run server`。
@@ -39,7 +39,7 @@ pnpm run server --port 3081   # 省略 --port 时默认 3081
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--port` | `3081` | 单端口承载浏览器 HTTP/WS + 客户端隧道 WS |
+| `--port` | `9000` | 单端口承载浏览器 HTTP/WS + 客户端隧道 WS |
 | `--tunnel-path` | `/__gateway__/tunnel` | 隧道接入路径（仅接受 WS upgrade） |
 | `--select-path` | `/__gateway__/select` | 内置选择页路径 |
 | `--tunnel-permessage-deflate` | 关闭 | 隧道 WS 开启 permessage-deflate 压缩（≥1KB 帧才压缩，SSE 小帧不受影响）；跨机房/跨境部署建议开启，显著降低高 RTT 链路传输时间，代价是两端少量 CPU |
@@ -54,7 +54,7 @@ pnpm run server --port 3081   # 省略 --port 时默认 3081
 ```js
 export default {
   upstreamUrl: 'http://localhost:3080',  // 本机要暴露的应用服务地址（http/https）
-  gatewayUrl: 'ws://<网关地址>:3081/__gateway__/tunnel',  // 网关隧道端点（ws/wss）
+  gatewayUrl: 'ws://<网关地址>:9000/__gateway__/tunnel',  // 网关隧道端点（ws/wss）
   hostname: 'pc-a',                      // 选择页展示名与路由标识，全网关内唯一
   token: 'secret-token',                 // 可选：本机接入令牌，配置后用户须输入该 token
   defaultPath: '/',                      // 可选：选择成功后浏览器跳转路径，默认 '/'
@@ -69,7 +69,7 @@ pnpm client
 
 ### 4. 浏览器使用
 
-1. 打开 `http://<网关地址>:3081/`，无会话时自动 302 到选择页
+1. 打开 `http://<网关地址>:9000/`，无会话时自动 302 到选择页
 2. 点击目标电脑图标，输入该机的 token
 3. 验证通过后跳转该电脑的 `defaultPath`，后续请求经隧道直达本机服务
 4. 退出 = 关闭浏览器（session cookie 失效）
@@ -105,7 +105,7 @@ export default {
 
 | 命令 | 说明 |
 |------|------|
-| `pnpm run server` | 启动网关服务端（默认端口 3081；与 pnpm 内置命令重名，须带 `run`） |
+| `pnpm run server` | 启动网关服务端（默认端口 9000；与 pnpm 内置命令重名，须带 `run`） |
 | `pnpm client` | 启动网关客户端（默认读 `packages/client/client.config.mjs`） |
 | `pnpm typecheck` | TypeScript 类型检查（全部包） |
 | `pnpm test` | vitest 测试 |

@@ -1,0 +1,31 @@
+{
+  "name": "gateway-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "bin": {
+    "harness-proxy": "./bin/harness-proxy.mjs"
+  },
+  "scripts": {
+    "start": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit",
+    "format": "eslint . --fix",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "tsx": "^4.19.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "eslint": "^9",
+    "jiti": "^2.7.0",
+    "typescript": "^5",
+    "typescript-eslint": "^8.61.0",
+    "vitest": "^4.1.8"
+  }
+}

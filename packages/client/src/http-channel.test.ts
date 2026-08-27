@@ -5,6 +5,8 @@
  */
 
 import { createServer, type RequestListener, type Server } from 'node:http';
+import http from 'node:http';
+import net from 'node:net';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -109,8 +111,9 @@ describe('HttpChannel', () => {
     const conn = new FakeConnection();
     const ch = new HttpChannel({
       id: 1,
-      open: makeOpen({ headers: { host: 'gateway.example', origin: 'http://pc-local:3081' } }),
-      upstream: up.url, connection: conn.asConnection(), authorize: ALLOW, logger: nullLogger, onDone: () => {},
+      open: makeOpen({ headers: { host: 'gateway.example', origin: 'http://pc-local:9000' } }),
+      upstream: up.url, connection: conn.asConnection(), authorize: ALLOW, logger: nullLogger,
+      onDone: () => {},
     });
     await ch.start();
     ch.onBodyEnd();
@@ -131,6 +134,54 @@ describe('HttpChannel', () => {
     ch.onBodyEnd();
     await new Promise((r) => setTimeout(r, 50));
     expect(up.hits[0]?.headers['origin']).toBeUndefined();
+  });
+
+  it('陈旧 keep-alive 连接：复用即 RST 时幂等请求自动换新连接重试一次（不再 502）', async () => {
+    // 裸 TCP 假 upstream：每个 socket 的第一个请求回 200 keep-alive，第二个请求直接 RST——
+    // 精确复现"Agent 复用了对端已关闭的空闲 socket"的竞态（生产：插件资源间歇 502）
+    const warns: string[] = [];
+    const warnLogger = {
+      debug() {}, info() {}, error() {},
+      warn(msg: string) { warns.push(msg); },
+    } as unknown as import('./logger').Logger;
+    const raw = net.createServer((socket) => {
+      let requests = 0;
+      socket.on('data', () => {
+        requests += 1;
+        if (requests === 1) {
+          socket.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: keep-alive\r\n\r\nok');
+        } else {
+          socket.destroy(); // 陈旧连接：复用时 RST
+        }
+      });
+    });
+    await new Promise<void>((r) => raw.listen(0, '127.0.0.1', r));
+    const rawAddr = raw.address();
+    const rawPort = typeof rawAddr === 'object' && rawAddr ? rawAddr.port : 0;
+    const agent = new http.Agent({ keepAlive: true, keepAliveMsecs: 1000 });
+    // 预热连接池：第一请求留下空闲 keep-alive socket 供通道复用
+    await new Promise<void>((resolve, reject) => {
+      const req = http.get({ host: '127.0.0.1', port: rawPort, path: '/warm', agent }, (res) => {
+        res.resume();
+        res.on('end', () => resolve());
+      });
+      req.on('error', reject);
+    });
+    const conn = new FakeConnection();
+    const ch = new HttpChannel({
+      id: 1, open: makeOpen(), upstream: new URL(`http://127.0.0.1:${rawPort}`),
+      connection: conn.asConnection(), authorize: ALLOW, logger: warnLogger, agent,
+      onDone: () => {},
+    });
+    await ch.start();
+    ch.onBodyEnd();
+    await new Promise((r) => setTimeout(r, 200));
+    // 首次落在陈旧 socket 上被 RST → 重试换新 socket → 200
+    expect(warns.some((m) => m.includes('陈旧连接'))).toBe(true);
+    const head = conn.controls.find((f) => f.type === 'http.head');
+    expect(head).toMatchObject({ status: 200 });
+    agent.destroy();
+    await new Promise<void>((r) => raw.close(() => r()));
   });
 
   it('POST 大 body 流式透传到 upstream', async () => {

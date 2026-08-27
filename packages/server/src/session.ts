@@ -33,27 +33,45 @@ export interface TunnelHandle {
 const HIGH_WATER_BYTES = 16 * 1024 * 1024;
 const LOW_WATER_BYTES = 4 * 1024 * 1024;
 const DRAIN_POLL_MS = 100;
+/**
+ * tunnel.ack 回执节拍：每收到 ACK_EVERY_BYTES 数据帧字节回一次累计值，不足节拍时
+ * ACK_FLUSH_MS 兜底回执（在途量尾数永不回执会让客户端流量窗口滞回线死锁：生产方等在
+ * 窗口 1/4 处，服务端却因不足 128KiB 不再回执）。
+ * 128KiB 节拍 + 1s 兜底保证最劣 50KB/s 链路下 ack 间隔 ≈1s ≪ 客户端心跳判死窗（90s），
+ * 下载方向（服务端→客户端静默）由此获得规律入站活性，心跳判死不被拥塞蒙蔽（线上断连根因修复）
+ */
+const ACK_EVERY_BYTES = 128 * 1024;
+const ACK_FLUSH_MS = 1000;
 
 export class TunnelSession implements TunnelHandle {
   /** 服务端分配的隧道标识（uuid；hello 回带复用时为回带值） */
   readonly tunnelId: string;
   readonly hostname: string;
   readonly defaultPath: string;
+  /** 客户端 hello 声明支持 tunnel.ack 端到端流量窗口时才回执（老客户端未声明不回，防未知帧坏帧预算误杀） */
+  private readonly flowAck: boolean;
   private nextChannelId = 1;
   private readonly channels = new Map<number, PendingChannel>();
   private drainWaiters: Array<() => void> = [];
   private drainTimer: NodeJS.Timeout | null = null;
   private down = false;
+  /** 已接收数据帧字节累计（含帧头，与客户端 dataBytesSent 同口径）；ack 回执的基准 */
+  private dataBytesReceived = 0;
+  /** 最近一次 ack 回执时的 dataBytesReceived：按 ACK_EVERY_BYTES 节拍节流 */
+  private lastAckSentBytes = 0;
+  /** 不足节拍时的兜底回执定时器（防在途量尾数永不回执导致客户端流量窗口死锁） */
+  private ackFlushTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly ws: WebSocket,
-    info: { tunnelId: string; hostname: string; defaultPath: string },
+    info: { tunnelId: string; hostname: string; defaultPath: string; flowAck?: boolean },
     private readonly logger: Logger,
     private readonly onDown: (session: TunnelSession) => void,
   ) {
     this.tunnelId = info.tunnelId;
     this.hostname = info.hostname;
     this.defaultPath = info.defaultPath;
+    this.flowAck = info.flowAck === true;
   }
 
   register(channel: PendingChannel): number {
@@ -109,10 +127,55 @@ export class TunnelSession implements TunnelHandle {
     });
   }
 
+  /**
+   * 数据帧接收记账（tunnel.ts 在解码成功后调用，frameBytes 含 4 字节头长 + JSON 头 + 负载）：
+   * 声明了 flowControl 的客户端按 ACK_EVERY_BYTES 节拍回 tunnel.ack（累计值），
+   * 不足节拍时 ACK_FLUSH_MS 兜底回执（尾数不回执会让客户端等在窗口滞回线形成死锁）。
+   * 回执即背压信号也是心跳活性载体。
+   */
+  noteDataReceived(frameBytes: number): void {
+    if (!this.flowAck) return;
+    this.dataBytesReceived += frameBytes;
+    if (this.dataBytesReceived - this.lastAckSentBytes >= ACK_EVERY_BYTES) {
+      this.flushAck();
+    } else {
+      this.scheduleAckFlush();
+    }
+  }
+
+  /** 兜底回执调度：已有定时器则不重复排期 */
+  private scheduleAckFlush(): void {
+    if (this.ackFlushTimer) return;
+    this.ackFlushTimer = setTimeout(() => {
+      this.ackFlushTimer = null;
+      this.flushAck();
+    }, ACK_FLUSH_MS);
+    this.ackFlushTimer.unref(); // 不阻止进程退出
+  }
+
+  /** 回执累计值（幂等：无新增不重复发）；发送失败（连接关闭中）由 close 事件自清 */
+  private flushAck(): void {
+    if (this.ackFlushTimer) {
+      clearTimeout(this.ackFlushTimer);
+      this.ackFlushTimer = null;
+    }
+    if (this.dataBytesReceived === this.lastAckSentBytes) return;
+    this.lastAckSentBytes = this.dataBytesReceived;
+    try {
+      this.sendControl({ type: 'tunnel.ack', bytes: this.dataBytesReceived });
+    } catch {
+      // ws 关闭窗内 send 抛错：隧道将断，ack 失去意义，close 事件随后自清
+    }
+  }
+
   /** 隧道断开：全部通道失败 + 唤醒悬挂的 waitDrain + 通知注册表注销（幂等） */
   teardown(): void {
     if (this.down) return;
     this.down = true;
+    if (this.ackFlushTimer) {
+      clearTimeout(this.ackFlushTimer);
+      this.ackFlushTimer = null;
+    }
     const all = [...this.channels.entries()];
     this.channels.clear();
     // 通道级隔离：单通道 onTunnelDown 异常不影响其余通道与 onDown（否则 registry 泄漏死会话）

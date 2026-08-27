@@ -1,10 +1,14 @@
 /**
- * 网关隧道连接管理 — hello 握手、自动重连（指数退避+抖动）、应用层心跳、聚合背压。
+ * 网关隧道连接管理 — hello 握手、自动重连（指数退避+抖动）、应用层心跳、聚合背压 + 端到端流量窗口。
  * 语义（spec §6）：connect() 首连失败按退避持续重试，connectTimeoutMs 内未就绪则 reject；
  * 4409 = 进程级错误（旧版服务端 hostname 冲突，现行服务端同名并存不发出），connect() 立即 reject 且不重连。
  * tunnelId 复用：进程内存记住最近一次 hello.ack 的 tunnelId，重连 hello 回带请求复用
  * （服务端空闲即复用，浏览器老会话随之恢复）；ack 以服务端最终决定为准更新本地记忆。
- * 注意：hello.ack/ping/pong 在本层消化，不上抛；'error' 事件必须被外层监听（EventEmitter 语义）。
+ * 端到端流量窗口（spec §4.3）：hello 声明 flowControl，服务端按收到数据帧累计字节定期回 tunnel.ack；
+ * 客户端以 dataBytesSent - dataBytesAcked 度量端到端在途量（内核/中间盒缓冲对应用不可见，
+ * 本地 bufferedAmount 只是本机队列），超窗暂停生产。ack 同时为下载方向提供规律入站活性，
+ * 心跳"静默判死"因此不会被限流拥塞蒙蔽（线上断连根因修复）。
+ * 注意：hello.ack/ping/pong/tunnel.ack 在本层消化，不上抛；'error' 事件必须被外层监听（EventEmitter 语义）。
  */
 
 import { EventEmitter } from 'node:events';
@@ -45,9 +49,18 @@ export interface ConnectionHandlers {
 const HIGH_WATER_BYTES = 16 * 1024 * 1024;
 const LOW_WATER_BYTES = 4 * 1024 * 1024;
 const DRAIN_POLL_MS = 100;
+// 端到端流量窗口（tunnel.ack 驱动的在途量钳制，线上断连根因修复）：
+// 窗口同时是"控制帧队头阻塞上限"——http.head 等控制帧排在数据帧之后，在途量 ÷ 共享带宽
+// 就是控制帧的最坏延迟，必须 ≪ 服务端 headTimeoutMs（120s）；故窗口随 ack 实测速率自适应
+// （目标 10s 在途），慢链路收紧、快链路放宽， clamp 在 [256KiB, 4MiB]
+const FLOW_WINDOW_MIN_BYTES = 256 * 1024;
+const FLOW_WINDOW_MAX_BYTES = 4 * 1024 * 1024;
+const FLOW_TARGET_DELAY_MS = 10_000;
+/** ack 速率采样的 EWMA 平滑系数（新样本权重） */
+const FLOW_RATE_EWMA_ALPHA = 0.3;
 /** close() 时对端不配合关闭的强制 terminate 等待 */
 const CLOSE_FORCE_MS = 5000;
-/** 心跳判死：连续 N 个心跳周期无任何入站消息判定死连接（默认 30s 周期 × 3 = 90s，容忍链路瞬时 stall） */
+/** 心跳判死：连续 N 个心跳周期无任何入站消息判定死连接（默认 30s × 3 = 90s；大流量下的入站活性由 tunnel.ack 兜底，见文件头） */
 const DEAD_AFTER_MISSED_HEARTBEATS = 3;
 /** 坏帧降级预算（spec §7 帧级）：连续 N 帧解码失败才升级为隧道级协议错误断开 */
 const MAX_CONSECUTIVE_BAD_FRAMES = 5;
@@ -75,6 +88,17 @@ export class Connection extends EventEmitter {
   private badFrameEscalated = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  /** 已发送数据帧字节累计（端到端在途量 = dataBytesSent - dataBytesAcked） */
+  private dataBytesSent = 0;
+  /** 服务端 tunnel.ack 回执的数据帧字节累计（单调取大） */
+  private dataBytesAcked = 0;
+  /** 收到首个 tunnel.ack 才激活流量窗口：老服务端不回 ack = 不支持，回退本地水位背压 */
+  private flowAckActive = false;
+  /** ack 实测接收速率 EWMA（字节/秒）：自适应窗口的依据；0 = 尚无样本（按最小窗口） */
+  private flowRateBps = 0;
+  /** 最近一次用于速率采样的 ack 时刻与字节数 */
+  private lastRateSampleAt = 0;
+  private lastRateSampleBytes = 0;
   private drainWaiters: Array<() => void> = [];
   private drainTimer: NodeJS.Timeout | null = null;
   private connectResolve: (() => void) | null = null;
@@ -130,18 +154,37 @@ export class Connection extends EventEmitter {
     this.ws.send(encodeControl(frame));
   }
 
-  /** 发送数据帧；返回 false = 超聚合高水位，调用方应暂停生产并 waitDrain() 后恢复 */
+  /**
+   * 发送数据帧；返回 false = 应暂停生产并 waitDrain() 后恢复。两种背压：
+   * ① 本地聚合水位（ws.bufferedAmount 超 HIGH_WATER_BYTES，防本机内存放大）；
+   * ② 端到端流量窗口（flowAckActive 后在途量超 FLOW_WINDOW_HIGH_BYTES，
+   *    钳制内核/中间盒不可见缓冲，保证 tunnel.ack 在心跳判死窗内可达）。
+   */
   sendData(header: DataHeader, payload: Buffer): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('tunnel not ready');
-    this.ws.send(encodeData(header, payload));
-    if (this.ws.bufferedAmount > HIGH_WATER_BYTES) {
+    const encoded = encodeData(header, payload);
+    this.dataBytesSent += encoded.length; // 端到端在途量记账（服务端按同口径累计回执）
+    this.ws.send(encoded);
+    if (this.ws.bufferedAmount > HIGH_WATER_BYTES || this.flowWindowExceeded()) {
       this.startDrainPoll();
       return false;
     }
     return true;
   }
 
-  /** 等聚合发送缓冲回落到低水位以下 */
+  /** 端到端在途量（已发送未被 ack 的数据帧字节）是否超出当前自适应窗口 */
+  private flowWindowExceeded(): boolean {
+    const inFlight = this.dataBytesSent - this.dataBytesAcked;
+    return this.flowAckActive && inFlight > this.currentFlowWindow();
+  }
+
+  /** 当前流量窗口：ack 实测速率 × 目标在途时长，clamp [FLOW_WINDOW_MIN_BYTES, FLOW_WINDOW_MAX_BYTES]；无样本按最小窗口 */
+  private currentFlowWindow(): number {
+    const target = (this.flowRateBps * FLOW_TARGET_DELAY_MS) / 1000;
+    return Math.min(FLOW_WINDOW_MAX_BYTES, Math.max(FLOW_WINDOW_MIN_BYTES, target));
+  }
+
+  /** 等发送缓冲/在途量回落到恢复水位以下 */
   waitDrain(): Promise<void> {
     return new Promise<void>((resolve) => {
       this.drainWaiters.push(resolve);
@@ -181,16 +224,25 @@ export class Connection extends EventEmitter {
     this.ws = ws;
     this.consecutiveBadFrames = 0;
     this.badFrameEscalated = false;
+    this.dataBytesSent = 0;
+    this.dataBytesAcked = 0;
+    this.flowAckActive = false;
+    this.flowRateBps = 0;
+    this.lastRateSampleAt = 0;
+    this.lastRateSampleBytes = 0;
 
     ws.on('open', () => {
       // 过期/关闭守卫：closing 中或已被更新尝试取代的旧 ws，不得再发 hello
       if (this.closing || this.ws !== ws) return;
       this.lastActivityAt = Date.now();
       // 首帧必须是 hello（spec §4.1：连接建立后首帧发送，不含 token）；
-      // 重连回带上次 tunnelId 请求复用（服务端空闲即保留浏览器会话，首连无此字段）
-      const client = this.lastTunnelId
-        ? { ...this.opts.hello, tunnelId: this.lastTunnelId }
-        : this.opts.hello;
+      // 重连回带上次 tunnelId 请求复用（服务端空闲即保留浏览器会话，首连无此字段）；
+      // flowControl 声明支持 tunnel.ack 端到端流量窗口（老服务端忽略该字段、不回 ack = 不支持）
+      const client = {
+        ...this.opts.hello,
+        flowControl: true,
+        ...(this.lastTunnelId ? { tunnelId: this.lastTunnelId } : {}),
+      };
       ws.send(encodeControl({ type: 'hello', client }));
     });
 
@@ -299,6 +351,28 @@ export class Connection extends EventEmitter {
       return;
     }
     if (frame.type === 'pong') return;
+    if (frame.type === 'tunnel.ack') {
+      // 端到端流量回执：首个 ack 激活流量窗口（证明服务端支持）；bytes 单调取大防乱序回退
+      this.flowAckActive = true;
+      if (typeof frame.bytes === 'number' && frame.bytes >= 0) {
+        // 速率采样（自适应窗口依据）：相邻两次推进的字节差 ÷ 时间差，EWMA 平滑；
+        // 采样基线在首个 ack 即建立（含 bytes=0 的起步回执），否则首个样本永远缺失
+        const now = Date.now();
+        const advanced = this.lastRateSampleAt > 0 && now > this.lastRateSampleAt
+          && frame.bytes > this.lastRateSampleBytes;
+        if (advanced) {
+          const elapsed = now - this.lastRateSampleAt;
+          const sample = ((frame.bytes - this.lastRateSampleBytes) / elapsed) * 1000;
+          this.flowRateBps = this.flowRateBps === 0
+            ? sample
+            : this.flowRateBps * (1 - FLOW_RATE_EWMA_ALPHA) + sample * FLOW_RATE_EWMA_ALPHA;
+        }
+        this.lastRateSampleAt = now;
+        if (frame.bytes > this.lastRateSampleBytes) this.lastRateSampleBytes = frame.bytes;
+        if (frame.bytes > this.dataBytesAcked) this.dataBytesAcked = frame.bytes;
+      }
+      return;
+    }
     this.callChannelHandler(() => this.handlers.onControl(frame));
   }
 
@@ -353,7 +427,11 @@ export class Connection extends EventEmitter {
     this.reconnectTimer = setTimeout(() => this.attempt(), delay);
   }
 
-  /** 应用层心跳：每周期发 ping；连续 DEAD_AFTER_MISSED_HEARTBEATS 个周期无任何入站判死，terminate 触发重连 */
+  /**
+   * 应用层心跳：每周期发 ping；连续 DEAD_AFTER_MISSED_HEARTBEATS 个周期无任何入站判死，terminate 触发重连。
+   * 大流量/限流链路下入站活性由 tunnel.ack 兜底（下载方向服务端→客户端本无流量，ack 随数据帧
+   * 接收进度规律回执），"静默"重新等价于"真死"，无需对拥塞做启发式豁免（线上断连根因修复）。
+   */
   private startHeartbeat(): void {
     this.stopHeartbeat();
     this.heartbeatTimer = setInterval(() => {
@@ -381,12 +459,14 @@ export class Connection extends EventEmitter {
     this.reconnectTimer = null;
   }
 
-  /** 背压轮询：缓冲低于低水位时唤醒全部等待方；无等待方即停 */
+  /** 背压轮询：本地缓冲低于低水位且在途量回到窗口 1/4 滞回线内时唤醒全部等待方；无等待方即停 */
   private startDrainPoll(): void {
     if (this.drainTimer) return;
     this.drainTimer = setInterval(() => {
       const amount = this.ws && this.ws.readyState === WebSocket.OPEN ? this.ws.bufferedAmount : 0;
       if (amount > LOW_WATER_BYTES) return;
+      const inFlight = this.dataBytesSent - this.dataBytesAcked;
+      if (this.flowAckActive && inFlight > this.currentFlowWindow() / 4) return;
       const waiters = this.drainWaiters.splice(0);
       for (const waiter of waiters) waiter();
       if (this.drainWaiters.length === 0 && this.drainTimer) {

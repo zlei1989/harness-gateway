@@ -18,6 +18,7 @@ pnpm-lock.yaml
 # testing
 /coverage
 **/coverage/
+.tmp-e2e/
 
 # next.js
 **/.next/
@@ -40,8 +41,6 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 dev-server*.log*
-TODO.md
-ws-probe*
 
 # env files (can opt-in for committing if needed)
 .env*

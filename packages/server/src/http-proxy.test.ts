@@ -4,7 +4,7 @@
  * 空体规则、head 超时 504、隧道断开 502。
  */
 
-import { createServer, type Server } from 'node:http';
+import { createServer, request as httpRequest, type Server } from 'node:http';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -25,6 +25,11 @@ class FakeTunnel {
   openFrames: Extract<ControlFrame, { type: 'http.open' }>[] = [];
   bodyChunks: Buffer[] = [];
   closes: number[] = [];
+  /** 测试旋钮：下一个 http.body 帧的 sendData 返回 false（模拟聚合高水位），消费后自动复位 */
+  highWaterOnce = false;
+  /** waitDrain 注册的回落实控器：测试手动放行以驱动 pause→resume 全流程 */
+  drainResolvers: Array<() => void> = [];
+  endFrames = 0;
   autoRespond: { status: number; headers: HeadersJson; body: Buffer } | null = {
     status: 200,
     headers: { 'content-type': 'text/plain', 'set-cookie': ['a=1', 'b=2'] },
@@ -43,19 +48,29 @@ class FakeTunnel {
     if (frame.type === 'channel.close') this.closes.push(frame.channelId);
   }
   sendData(header: DataHeader, payload: Buffer): boolean {
-    if (header.kind === 'http.body') this.bodyChunks.push(payload);
-    if (header.kind === 'http.body.end' && this.autoRespond) {
-      const channel = this.channels.get(header.channelId);
-      const resp = this.autoRespond;
-      queueMicrotask(() => {
-        channel?.onControl({ type: 'http.head', channelId: header.channelId, status: resp.status, headers: resp.headers });
-        channel?.onData({ channelId: header.channelId, kind: 'http.body' }, resp.body);
-        channel?.onData({ channelId: header.channelId, kind: 'http.body.end' }, Buffer.alloc(0));
-      });
+    if (header.kind === 'http.body') {
+      this.bodyChunks.push(payload);
+      if (this.highWaterOnce) {
+        this.highWaterOnce = false; // 仅第一帧报高水位
+        return false;
+      }
+      return true;
+    }
+    if (header.kind === 'http.body.end') {
+      this.endFrames += 1;
+      if (this.autoRespond) {
+        const channel = this.channels.get(header.channelId);
+        const resp = this.autoRespond;
+        queueMicrotask(() => {
+          channel?.onControl({ type: 'http.head', channelId: header.channelId, status: resp.status, headers: resp.headers });
+          channel?.onData({ channelId: header.channelId, kind: 'http.body' }, resp.body);
+          channel?.onData({ channelId: header.channelId, kind: 'http.body.end' }, Buffer.alloc(0));
+        });
+      }
     }
     return true;
   }
-  waitDrain(): Promise<void> { return Promise.resolve(); }
+  waitDrain(): Promise<void> { return new Promise((r) => this.drainResolvers.push(r)); }
   tunnelDown(channelId: number): void { this.channels.get(channelId)?.onTunnelDown(); }
   /** 手动驱动：回 http.head（SSE/慢速 upstream 用例须绕过 autoRespond） */
   sendHead(channelId: number, status: number, headers: HeadersJson): void {
@@ -163,6 +178,32 @@ describe('handleBrowserHttp', () => {
     const res = await fetch(`http://127.0.0.1:${port}/api/x`, { headers: { cookie: `gateway_sid=${uuid}` } });
     expect(res.status).toBe(200);
     expect(endSeen).toBe(true);
+  });
+
+  // 请求体聚合背压（大文件上传防服务端缓冲无界堆积）：sendData 报高水位 → 暂停读取请求体
+  // → waitDrain 回落 → 恢复转发，后续分块与 end 帧完整到达
+  it('请求体背压：超高水位暂停读取，waitDrain 回落后恢复转发', async () => {
+    const { port, tunnel, uuid } = await setup();
+    tunnel.autoRespond = null;
+    tunnel.highWaterOnce = true; // 第一个 body 帧报聚合高水位
+    // 原始 http 客户端逐块写请求体（chunked），便于观察 pause 行为
+    const req = httpRequest({
+      host: '127.0.0.1', port, path: '/upload', method: 'POST',
+      headers: { cookie: `gateway_sid=${uuid}`, 'transfer-encoding': 'chunked' },
+    });
+    req.on('response', (res) => res.resume()); // 终态响应（本例为 head 超时 504）直接排空
+    req.on('error', () => {}); // 收尾 destroy/服务关闭的 ECONNRESET 属预期，消化防未处理 error
+    req.write('chunk-A');
+    await waitFor(() => tunnel.bodyChunks.length === 1); // A 已转发并触发背压（req 已 pause）
+    await waitFor(() => tunnel.drainResolvers.length === 1); // 已登记 waitDrain 等待
+    req.write('chunk-B');
+    await new Promise((r) => setTimeout(r, 100));
+    expect(tunnel.bodyChunks.length).toBe(1); // 暂停生效：B 不得越过高水位继续转发
+    for (const resolve of tunnel.drainResolvers.splice(0)) resolve(); // 回落到低水位
+    await waitFor(() => tunnel.bodyChunks.length === 2); // 恢复读取：B 转发
+    req.end();
+    await waitFor(() => tunnel.endFrames === 1); // end 帧完整收尾
+    req.destroy();
   });
 
   it('等 http.head 超时 → 504 + channel.close', async () => {

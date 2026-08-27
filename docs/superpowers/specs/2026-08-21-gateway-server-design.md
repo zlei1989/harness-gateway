@@ -83,7 +83,7 @@ packages/server/
 import { GatewayServer } from 'gateway-server'
 
 const server = new GatewayServer({
-  port: 3081,                             // 单端口：浏览器流量 + 隧道共用
+  port: 9000,                             // 单端口：浏览器流量 + 隧道共用
   tunnelPath: '/__gateway__/tunnel',      // 隧道接入路径（默认值）
   selectPath: '/__gateway__/select',      // 选择页路径（默认值）
   // helloTimeoutMs: 15000,               // 等 hello 帧超时
@@ -97,7 +97,7 @@ await server.listen()
 await server.close()  // 关所有隧道 + 失败全部在途通道 + 关 http.Server
 ```
 
-CLI：`harness-server --port 3081 [--tunnel-path ...] [--select-path ...] [--tunnel-permessage-deflate] [--keep-alive-timeout-ms <ms>]`；非法参数打印用法，退出码 1。SIGINT/SIGTERM 触发 `close()`。
+CLI：`harness-server --port 9000 [--tunnel-path ...] [--select-path ...] [--tunnel-permessage-deflate] [--keep-alive-timeout-ms <ms>]`；非法参数打印用法，退出码 1。SIGINT/SIGTERM 触发 `close()`。
 
 ## 4. 单端口流量分发
 
@@ -118,11 +118,12 @@ upgrade 分发沿用 `ws-gateway.ts` 范式：`WebSocketServer({ noServer: true 
 ```text
 客户端 WS upgrade 命中 tunnelPath
   → 接受 → 等 hello 控制帧（helloTimeoutMs 15s，超时断开）
-       { type:'hello', client:{ hostname, defaultPath, tunnelId? } }   ← 不含 token；tunnelId 仅重连时回带
+       { type:'hello', client:{ hostname, defaultPath, tunnelId?, flowControl? } }   ← 不含 token；tunnelId 仅重连时回带
   → 决定 tunnelId：回带值符合 uuid 形态且当前无在线隧道占用 → 复用；
      否则（未回带/非法形态/被占用）分配新 randomUUID()——被占用不互踢（无隧道认证现状下避免互踢面）
   → 回 { type:'hello.ack', tunnelId }，登记 tunnels: Map<tunnelId, TunnelSession>
   → 隧道就绪，开始接受浏览器流量
+  → hello.flowControl === true 时启用 tunnel.ack 流量回执（见下）
 ```
 
 - **tunnelId 是隧道路由唯一身份**（2026-08-24 起）：hostname 纯展示名、同名并存，不再有 4409 同名仲裁（客户端保留 4409 处理仅作旧版服务端兼容，属不可达分支）
@@ -130,6 +131,7 @@ upgrade 分发沿用 `ws-gateway.ts` 范式：`WebSocketServer({ noServer: true 
 - `channelId`：服务端按隧道会话内递增整数分配；隧道重连后旧会话通道已全部清理，编号空间重置无冲突
 - 隧道断开：该隧道全部在途通道失败（HTTP 502 / WS 断开），`tunnels` 注销 tunnelId；**`sessions` 保留**——客户端回带 tunnelId 重连复用后老 cookie 自动恢复可用，免重新选择（复用失败分到新 id 时老会话随之失效，需重新登录）
 - 心跳：响应客户端 `ping` 控制帧回 `pong`
+- **tunnel.ack 流量回执**（2026-08-27 线上断连根因补记，机制全貌见客户端 spec §4.4）：仅当 hello 声明 `flowControl: true` 时启用（老客户端未声明不回执——未知帧会消耗其坏帧预算）；按收到的数据帧字节累计（含帧头，与客户端发送记账同口径）每 128KiB 回 `{type:'tunnel.ack', bytes}`，不足节拍时 1s 兜底回执（在途量尾数永不回执会让客户端流量窗口滞回线死锁）。回执既是端到端背压信号，也是客户端心跳的入站活性载体
 
 ## 6. 选择页与浏览器会话（select-page.ts / browser-session.ts）
 
@@ -182,7 +184,9 @@ cookie 检查：无/失效 gateway_sid → 302 selectPath
       ② 从 Cookie 头剥离 gateway_sid（其余应用 cookie 原样透传）
       ③ 注入 X-Forwarded-For: {浏览器 remoteAddress}（已有值则追加，供客户端钩子取真实 IP）
     headers 编码约定 string | string[]（多值头如 Set-Cookie 用数组，见客户端 spec §4.1）
-浏览器请求体 → http.body 数据帧（流式，不缓冲；无 body 也必须发空载 http.body.end 收尾）
+浏览器请求体 → http.body 数据帧（流式，不缓冲；无 body 也必须发空载 http.body.end 收尾；
+  隧道聚合缓冲超高水位时暂停读取浏览器请求体，waitDrain 回落后恢复——对称 ws-proxy 与客户端
+  http-channel 的聚合背压，防大文件上传经限流隧道时服务端发送缓冲无界堆积）
 等 http.head（headTimeoutMs 120s 超时 → 504 + channel.close）
   → 回写 status/headers（含应用的 Set-Cookie 原样透传回浏览器）
   → http.body 帧 → 浏览器响应流；http.body.end → 收尾

@@ -203,10 +203,17 @@ export function handleBrowserHttp(
   ctx.logger.info('请求入口', { channelId, method: req.method, url: safePathname(req.url) ?? '/', hostname: session.hostname });
 
   // 请求体流式透传；空体规则：end 事件必发空载 http.body.end。
+  // 聚合背压（对称 ws-proxy 与客户端 http-channel，线上断连根因修复）：sendData 超聚合高水位
+  // 即暂停读取浏览器请求体，waitDrain 回落到低水位后恢复；此前忽略返回值，大文件上传经限流
+  // 隧道时服务端发送缓冲无界堆积（内存放大，且 pong 等控制帧被压在堆积之后加剧心跳饥饿）。
   // 无需 exceedsMaxDataFrame 护栏：chunk 来自 Node 流读取（≪100MiB），数学上不可能超隧道帧上限；
   // encodeData 的 PayloadTooLargeError 兜底防协议失配（WS 消息路径尺寸不受控，护栏在 ws-proxy）
   req.on('data', (chunk: Buffer) => {
-    if (!finished) tunnel.sendData({ channelId, kind: 'http.body' }, chunk);
+    if (finished) return;
+    if (!tunnel.sendData({ channelId, kind: 'http.body' }, chunk)) {
+      req.pause();
+      void tunnel.waitDrain().then(() => { if (!finished) req.resume(); });
+    }
   });
   req.on('end', () => {
     if (!finished) tunnel.sendData({ channelId, kind: 'http.body.end' }, Buffer.alloc(0));

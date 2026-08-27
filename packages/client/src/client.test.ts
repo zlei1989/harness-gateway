@@ -59,7 +59,7 @@ describe('Client 生命周期与帧路由', () => {
     const client = new Client({ ...BASE, upstreamUrl: 'http://127.0.0.1:1', gatewayUrl: gw.url });
     client.on('error', () => {});
     await client.connect();
-    expect(gw.received[0]).toEqual({ type: 'hello', client: { hostname: 'pc-a', defaultPath: '/' } });
+    expect(gw.received[0]).toEqual({ type: 'hello', client: { hostname: 'pc-a', defaultPath: '/', flowControl: true } });
     await client.close();
     await gw.close();
   });
