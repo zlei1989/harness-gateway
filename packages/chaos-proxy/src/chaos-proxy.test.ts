@@ -352,10 +352,10 @@ describe('setAdmissionRate 连接准入', () => {
     await admitted(dial(port)); // s1 占掉唯一名额，保持在线
     const s2 = dial(port);
     await new Promise<void>((r) => s2.on('connect', r));
-    s2.destroy(); // 排队中放弃：出队取消，不占名额
+    s2.destroy(); // 排队中放弃（未发数据形态：close 即时触发、出队取消不占名额）
     const s3 = dial(port);
     proxy.setAdmissionRate(0); // 关闭准入：排队连接立即全部放行（死连接跳过）
     await admitted(s3);
-    expect(proxy.stats().connections).toBe(2); // s1 + s3：已毁的 s2 被跳过、未建 conn
+    expect(proxy.stats().connections).toBe(2); // s1 + s3：s2 已出队/回收、未滞留 conn（已发数据形态的「幽灵放行」边界见 chaos-proxy.ts createServer 注释）
   }, 10_000);
 });

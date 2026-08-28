@@ -46,7 +46,8 @@
 harness-gateway/       # pnpm monorepo（TS 源码直出，无构建产物，经 tsx 运行）
 ├── packages/
 │   ├── server/        # 网关服务端 — 单端口承载浏览器 HTTP/WS + 客户端隧道 WS；选择页、会话、路由、双向桥接
-│   └── client/        # 网关客户端 — 主动出站连网关、hello 登记 hostname，将隧道流量还原为对本地 upstream 的请求
+│   ├── client/        # 网关客户端 — 主动出站连网关、hello 登记 hostname，将隧道流量还原为对本地 upstream 的请求
+│   └── chaos-proxy/   # TCP 故障注入测试库 — e2e-chaos 基座；throttle-proxy 脚本承载 pnpm run proxy 限流验证
 ├── docs/superpowers/  # 设计 spec 与实施 plan
 └── eslint.shared.ts   # 共享 ESLint 配置
 ```

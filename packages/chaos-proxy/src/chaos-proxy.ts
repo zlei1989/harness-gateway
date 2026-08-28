@@ -20,6 +20,7 @@ export interface ChaosProxy {
   heal(): void;
   setLatency(ms: number, jitterMs?: number): void;
   setThrottle(bytesPerSec: number, mode?: ChaosThrottleMode): void;
+  /** 连接准入限速（0 = 关闭，清队即放）；补充节拍 floor(1000/rate) ≥ 1ms，rate >1000 时实际封顶 ~1000/s */
   setAdmissionRate(connPerSec: number): void;
   setIdleTimeout(ms: number): void;
   flappy(intervalMs: number): void;
@@ -181,7 +182,10 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
   const server = net.createServer((client) => {
     if (closed) { client.destroy(); return; }
     if (admissionPerSec > 0) {
-      // 准入排队：FIFO 等放行；排队中 close 出队取消（不空耗名额）
+      // 准入排队：FIFO 等放行；排队中 close 出队取消（不空耗名额）。
+      // 边界：对端已发数据再干净断开时 FIN 堵在未读数据后，close 不即时触发——
+      // 尸体由放行后 FIN 传播自清（瞬占一枚令牌 + 建一条即刻拆除的 target 连接），
+      // 非产品化定位下接受此「幽灵放行」自愈行为（final review 实证：无崩溃/泄漏/悬挂）。
       admissionQueue.push(client);
       client.once('close', () => {
         const index = admissionQueue.indexOf(client);
@@ -217,7 +221,8 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
     if (conn.s2c.blackholed) target.pause();
   }
 
-  /** 按令牌放行队首（满桶突发 + 匀速补充）；死 socket 跳过不占名额 */
+  /** 按令牌放行队首（满桶突发 + 匀速补充）；死 socket 跳过不占名额
+      （仅限已触发 close 者——已发数据的干净断开见 createServer 注释，由放行后 FIN 自清） */
   function drainAdmission(): void {
     while (admissionTokens > 0) {
       const client = admissionQueue.shift();

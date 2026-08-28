@@ -1571,7 +1571,7 @@ git commit -m "test(gateway-server): 多连接真机 e2e——4 leg 大文件双
 
 ```bash
 # 终端1：pnpm run server --port 9000
-# 终端2：throttle-proxy 限流挂在 server 与 client 之间：
+# 终端2：throttle-proxy 限流挂在 server 与 client 之间（--throttle 5m = 共享 5MiB/s）：
 #         tsx packages/chaos-proxy/scripts/throttle-proxy.ts --throttle 5m --shared --latency 100
 # 终端3：upstream 起一个返回 100MiB 文件的 http 服务；client connections=1 与 connections=4
 #         各跑一次浏览器侧下载计时（服务端「请求完成」日志的 totalMs 字段）
@@ -1589,7 +1589,7 @@ git commit -m "test(gateway-server): 多连接真机 e2e——4 leg 大文件双
 > 状态：**待人工执行**（T10 只落地步骤，不在自动化任务内执行）。执行后把实测数据回填到本节末尾再合入主线。
 
 1. 终端1：`pnpm run server --port 9000` 起网关服务端。
-2. 终端2：throttle-proxy 挂在 server 与 client 之间：`tsx packages/chaos-proxy/scripts/throttle-proxy.ts --throttle 5m --shared --latency 100`（共享 5Mbps + RTT 100ms）。
+2. 终端2：throttle-proxy 挂在 server 与 client 之间：`tsx packages/chaos-proxy/scripts/throttle-proxy.ts --throttle 5m --shared --latency 100`（共享 5MiB/s + RTT 100ms）。
 3. 终端3：upstream 起一个返回 100MiB 文件的 http 服务；client 分别以 `connections: 1` 与 `connections: 4`（`packages/client/client.config.mjs`）各跑一次。
 4. 浏览器侧各下载一次 100MiB 文件并计时；同时对照服务端「请求完成」日志的 `totalMs`/`headMs`/`bodyBytes` 字段。
 5. 预期：4 连接显著快于单连接；若无收益，回 spec §1.2 调整默认值（确认收益后才定稿默认 4）。

@@ -62,7 +62,9 @@ setThrottle(bytesPerSec: number, mode?: 'per-conn' | 'shared'): void;
 setAdmissionRate(connPerSec: number): void;  // 0 = 不限（缺省）
 ```
 
-- 新建连接进 FIFO 队列，按速率放行：每 `1000/rate` ms 放一队首（匀速放行，非突发桶）。
+- 新建连接进 FIFO 队列，按令牌放行：满桶起步（容量 = rate，前 rate 个立即通），此后每 `1000/rate` ms 补 1 放 1（容量封顶）。
+  （勘误：本行原写「匀速放行，非突发桶」、§10 YAGNI 原列「准入限流的突发容量」——实现与评审确认采用满桶突发语义，
+  与被删 proxy 的 ConnectionLimiter（容量 8 突发 + 匀速补充）及 AGENT.md 验证拓扑一致；YAGNI 条目相应作废。）
 - 排队中 socket close → 出队取消（proxy ConnectionLimiter 同款语义：不空耗名额）。
 - 放行后才 `net.connect` target（与 proxy admit 语义一致：准入前不消耗 target 资源）。
 - 与 blackhole/rejectUpgrade 的关系：准入排队在故障判定**之前**——黑洞/拒升级期间新连接照样排队，放行后按当时故障状态处理（黑洞中建连即黑、reject 中建连即拒）。`setAdmissionRate(0)` 时排队连接立即全部放行（清空队列）。

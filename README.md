@@ -138,7 +138,7 @@ export default {
 packages/
 ├── server/   # gateway-server — 网关服务端：选择页、会话、路由、HTTP/WS 双向桥接
 ├── client/   # gateway-client — 网关客户端：出站连网关、鉴权、还原流量到本地 upstream
-├── chaos-proxy/        # chaos-proxy — TCP 故障注入代理（私有，测试专用：destroy/blackhole/latency/throttle/idle/flappy/reject）
+├── chaos-proxy/        # chaos-proxy — TCP 故障注入代理（私有，测试专用：destroy/blackhole/latency/throttle/admission/idle/flappy/reject）
 └── dsh-remote-access/   # dsh-remote-access — DSH 插件：设置页手动启用隧道接入网关（二维码深链）
 docs/superpowers/specs/   # 隧道帧协议与设计文档（改协议/行为前先读）
 ```
