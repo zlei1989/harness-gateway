@@ -19,14 +19,14 @@
 ### 拓扑
 
 ```text
-浏览器 ──HTTP/WS──> [proxy :9080 限流 8 连接/s + 全局 50KB/s] ──> [server :9000] <──WS 隧道(同过 proxy)── [client] ──> upstream(DSH Web :3088)
+浏览器 ──HTTP/WS──> [throttle-proxy :9080 准入 8 连接/s + 共享 50KB/s] ──> [server :9000] <──WS 隧道(同过 proxy)── [client] ──> upstream(DSH Web :3088)
 ```
 
 浏览器流量与隧道流量共享代理的 50KB/s 全局带宽桶，大文件/高并发场景下心跳、控制帧、数据帧互相挤压——线上断连类问题只在该形态下可复现。
 
 ### 步骤
 
-1. **启动三进程**（各开一个终端或后台任务）：`pnpm run proxy`、`pnpm run server`、`pnpm run client`（客户端读 `packages/client/client.config.mjs`：hostname=工位001、token=test、gatewayUrl 指向 :9080）。确认客户端日志出现"隧道就绪"、服务端日志出现"隧道接入"。
+1. **启动三进程**（各开一个终端或后台任务）：`pnpm run proxy`（chaos-proxy throttle-proxy 脚本：共享 50KB/s + 准入 8/s）、`pnpm run server`、`pnpm run client`（客户端读 `packages/client/client.config.mjs`：hostname=工位001、token=test、gatewayUrl 指向 :9080）。确认客户端日志出现"隧道就绪"、服务端日志出现"隧道接入"。
 2. **Playwright MCP 打开本地 Edge**，访问 `http://localhost:9080`，等待 302 重定向到 `/__gateway__/select` 选择页。
 3. **点击"工位001"卡片**；不存在则每 2s 刷新重试，30s 超时——超时先检查客户端/服务端日志是否报错再排查。
 4. **输入 Token `test`，点击"连接"**，等待跳转回 `/`（DSH GUI）。
@@ -37,7 +37,7 @@
 
 - 大文件下载/上传中途隧道断开（客户端日志 1006 + "心跳超时"）→ 心跳/流量窗口回归，先查 `connection.ts` 心跳与 `tunnel.ack` 流量窗口（spec §4.4）。
 - 资源加载间歇 502、客户端日志"upstream 不可达/socket hang up" → upstream 陈旧 keep-alive 复用，查 `http-channel.ts` 一次性重试与 Client agent `timeout: 4000`。
-- 响应尾包截断（差几十~几百字节）→ 中间盒在 FIN 后丢弃了节流队列，查 `packages/proxy/src/server.ts` 优雅关闭语义。
+- 响应尾包截断（差几十~几百字节）→ 中间盒在 FIN 后丢弃了节流队列，查 `packages/chaos-proxy/src/chaos-proxy.ts` FIN 排空传播语义（sourceClosed/destEnded）。
 - 会话列表/历史加载不出 → 先看服务端"请求完成"日志的 status/headMs/bodyBytes 分段，区分隧道段与 upstream 段。
 
 ## 目录

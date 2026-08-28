@@ -193,7 +193,7 @@ attach leg 上的数据帧可能比 primary 上的 `http.open` 先到——这�
 - **组发送单测**：加权选 leg 偏向空闲者 / 全满返回 false + 任一 leg 回落唤醒 / 未就绪 leg 不参与分发。
 - **attach 集成**：成功入组 / 未知 tunnelId → 4410 / 超上限 → 4410 / 老 server 式 ack（无 multiConn）→ 静默单 leg。
 - **session 多 leg**：per-leg ack 记账、teardown 关闭全部 leg、registry 身份校验不变。
-- **e2e**：4 leg 隧道 + 人为 leg 间延迟差（可复用 `packages/proxy` 的 throttle）跑大文件上传+下载，校验字节完整性与顺序；整组重连后 tunnelId 复用、浏览器会话恢复；`connections: 1` legacy 模式 e2e。
+- **e2e**：4 leg 隧道 + 人为 leg 间延迟差（可复用 `chaos-proxy` 的 setLatency/setThrottle）跑大文件上传+下载，校验字节完整性与顺序；整组重连后 tunnelId 复用、浏览器会话恢复；`connections: 1` legacy 模式 e2e。
 - **回归**：现有全部测试在默认配置下通过（现有 e2e 自动覆盖多 leg 路径）。
 - **性能验证（人工步骤）**：throttle 链路下 1 vs 4 连接大文件传输耗时对比，确认收益后定稿默认值 4。
 
