@@ -17,7 +17,9 @@ class MockGateway {
   sockets: WsWebSocket[] = [];
   received: ControlFrame[] = [];
   /** 测试旋钮：收到 hello 后的行为 */
-  helloAction: 'ack' | 'close4409' | 'ignore' = 'ack';
+  helloAction: 'ack' | 'close4409' | 'close4410' | 'ignore' = 'ack';
+  /** 测试旋钮：hello.ack 附带的 multiConn 协商结果（undefined = 老服务端，不回该字段） */
+  multiConnAck?: { max: number };
   /** 测试旋钮：hello.ack 延迟毫秒数（0 = 立即），用于构造"迟到的 ack"竞态 */
   ackDelayMs = 0;
   /** 测试旋钮：是否应答 ping（false = 模拟对端永不回 pong 的静默链路） */
@@ -36,11 +38,13 @@ class MockGateway {
         const frame = decodeControl(String(data));
         this.received.push(frame);
         if (frame.type === 'hello' && this.helloAction === 'ack') {
-          const reply = () => ws.send(encodeControl({ type: 'hello.ack', tunnelId: 'tid-1' }));
+          // multiConnAck 为 undefined 时 JSON.stringify 丢弃该键，legacy ack 形态不变
+          const reply = () => ws.send(encodeControl({ type: 'hello.ack', tunnelId: 'tid-1', multiConn: this.multiConnAck }));
           if (this.ackDelayMs > 0) setTimeout(reply, this.ackDelayMs);
           else reply();
         }
         if (frame.type === 'hello' && this.helloAction === 'close4409') ws.close(4409, 'hostname conflict');
+        if (frame.type === 'hello' && this.helloAction === 'close4410') ws.close(4410, 'attach rejected');
         if (frame.type === 'ping' && this.answerPings) ws.send(encodeControl({ type: 'pong' }));
       });
     });
@@ -117,6 +121,109 @@ describe('Connection', () => {
     await gw.close();
   });
 
+  it('已就绪后收到 4409：emit fatal 终态错误且不重连（与首连期 connect reject 路径区分）', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
+    conn.on('error', () => {});
+    const fatals: Error[] = [];
+    conn.on('fatal', (err: Error) => fatals.push(err));
+    await conn.connect();
+    expect(conn.ready).toBe(true);
+    gw.sockets[0]?.close(4409, 'hostname conflict');
+    await new Promise((r) => setTimeout(r, 200));
+    expect(fatals).toHaveLength(1);
+    expect(fatals[0]?.message).toMatch(/4409/);
+    expect(conn.ready).toBe(false);
+    expect(gw.sockets).toHaveLength(0); // 终态不重连
+    await conn.close();
+    await gw.close();
+  });
+
+  it('hello 携带 multiConn 声明；hello.ack 的 multiConn.max 经 serverMaxLegs 暴露', async () => {
+    const gw = new MockGateway();
+    gw.multiConnAck = { max: 16 };
+    const { handlers } = makeHandlers();
+    const conn = new Connection({
+      gatewayUrl: gw.url, ...OPTS,
+      hello: { hostname: 'pc-a', defaultPath: '/', multiConn: { count: 4 } },
+    }, handlers);
+    conn.on('error', () => {});
+    await conn.connect();
+    const hello = gw.received.find((f): f is Extract<ControlFrame, { type: 'hello' }> => f.type === 'hello');
+    expect(hello?.client.multiConn).toEqual({ count: 4 });
+    expect(conn.serverMaxLegs).toBe(16);
+    await conn.close();
+    await gw.close();
+  });
+
+  it('4410 = attach 拒绝：connect reject 且不重连；hello 携带 attach 与 initialTunnelId 植入的 tunnelId', async () => {
+    const gw = new MockGateway();
+    gw.helloAction = 'close4410';
+    const { handlers } = makeHandlers();
+    const conn = new Connection({
+      gatewayUrl: gw.url, ...OPTS,
+      hello: { hostname: 'pc-a', defaultPath: '/', attach: true, initialTunnelId: 'tid-x' },
+    }, handlers);
+    conn.on('error', () => {});
+    await expect(conn.connect()).rejects.toThrow(/4410/);
+    // attach hello：attach 标志下传，initialTunnelId 转化为线上 tunnelId 字段（内部字段本身不上线）
+    const hello = gw.received.find((f): f is Extract<ControlFrame, { type: 'hello' }> => f.type === 'hello');
+    expect(hello?.client.attach).toBe(true);
+    expect(hello?.client.tunnelId).toBe('tid-x');
+    expect(hello?.client).not.toHaveProperty('initialTunnelId');
+    await new Promise((r) => setTimeout(r, 200));
+    expect(gw.sockets.length + gw.received.length).toBeLessThanOrEqual(1 + 1); // 只连过 1 次（终态不重连）
+    await gw.close();
+  });
+
+  it('availableCapacity 未就绪为 0；就绪后为正', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
+    conn.on('error', () => {});
+    expect(conn.availableCapacity()).toBe(0);
+    await conn.connect();
+    expect(conn.availableCapacity()).toBeGreaterThan(0);
+    await conn.close();
+    await gw.close();
+  });
+
+  it('重连次数耗尽（网关彻底消失）：emit fatal 终态错误，不再重试', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    const conn = new Connection({
+      gatewayUrl: gw.url, ...OPTS,
+      reconnect: { baseDelayMs: 20, maxDelayMs: 80, maxRetries: 2 },
+    }, handlers);
+    conn.on('error', () => {});
+    const fatals: Error[] = [];
+    conn.on('fatal', (err: Error) => fatals.push(err));
+    await conn.connect();
+    await gw.close(); // 网关消失：后续重试全部 ECONNREFUSED，耗尽 maxRetries
+    await new Promise<void>((resolve) => {
+      if (fatals.length > 0) resolve();
+      else conn.on('fatal', () => resolve());
+    });
+    expect(fatals[0]?.message).toMatch(/reconnect exhausted/);
+    await conn.close();
+  });
+
+  it('瞬时断线（中间件杀连接）不 emit fatal：内建重连自动恢复', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
+    conn.on('error', () => {});
+    const fatals: Error[] = [];
+    conn.on('fatal', (err: Error) => fatals.push(err));
+    await conn.connect();
+    gw.dropAll();
+    await new Promise<void>((resolve) => conn.once('connected', resolve)); // 重连成功
+    expect(fatals).toHaveLength(0);
+    await conn.close();
+    await gw.close();
+  });
+
   it('断线自动重连：drop 后 disconnected → 重连成功再 connected，重连 hello 回带上次 tunnelId 请求复用', async () => {
     const gw = new MockGateway();
     const { handlers, calls } = makeHandlers();
@@ -134,6 +241,21 @@ describe('Connection', () => {
     const hellos = gw.received.filter((f) => f.type === 'hello');
     expect(hellos).toHaveLength(2);
     expect(hellos[1]).toEqual({ type: 'hello', client: { hostname: 'pc-a', defaultPath: '/', flowControl: true, tunnelId: 'tid-1' } });
+    await conn.close();
+    await gw.close();
+  });
+
+  // 726a481 回归锁（原唯一回归锁是 server 包 e2e S12）：定时器触发即清引用，
+  // 字段语义为"待触发的重连定时器"；触发后残留引用会让稳态不变量失真（S12 重连风暴场景暴露）
+  it('重连定时器触发后清引用：断线重连成功后 reconnectTimer 为 null', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
+    conn.on('error', () => {});
+    await conn.connect();
+    gw.dropAll();
+    await new Promise<void>((resolve) => conn.once('connected', resolve)); // 定时器已触发并重连成功
+    expect((conn as unknown as { reconnectTimer: unknown }).reconnectTimer).toBeNull();
     await conn.close();
     await gw.close();
   });

@@ -66,3 +66,5 @@ data/
 # SDD 执行过程产物
 /.superpowers/
 resources/test/result.json
+
+.worktrees/

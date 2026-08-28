@@ -3,11 +3,14 @@
  * 用最小模拟网关（ack hello、记录帧、可主动发 open）验证真实 WS 行为。
  */
 
-import { describe, expect, it } from 'vitest';
+import { createServer, type Server } from 'node:http';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer, type WebSocket as WsWebSocket } from 'ws';
 
 import { Client } from './client';
 import { type ControlFrame, decodeControl, encodeControl } from './protocol';
+import { MockGateway } from './test-utils/mock-gateway';
 
 /** 最小模拟网关：ack hello、记录帧、可主动发 open */
 class MiniGateway {
@@ -38,7 +41,7 @@ class MiniGateway {
   }
 }
 
-const BASE = { hostname: 'pc-a', heartbeatIntervalMs: 10_000, connectTimeoutMs: 2000 };
+const BASE = { hostname: 'pc-a', heartbeatIntervalMs: 10_000, connectTimeoutMs: 2000, connections: 1 };
 
 describe('Client 配置校验（进程级错误）', () => {
   it('缺 upstreamUrl / gatewayUrl / hostname → 构造即抛错', () => {
@@ -86,5 +89,62 @@ describe('Client 生命周期与帧路由', () => {
     await new Promise((r) => setTimeout(r, 30));
     await client.close();
     await gw.close();
+  });
+});
+
+describe('Client 多连接装配（connections + legCount）', () => {
+  let gateway: MockGateway;
+  let upstream: Server;
+  let upstreamUrl: string;
+
+  beforeEach(async () => {
+    // echo upstream：原样回写请求体（字节一致性断言用）
+    upstream = createServer((req, res) => {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      req.pipe(res);
+    });
+    await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r));
+    const addr = upstream.address();
+    if (typeof addr === 'string' || !addr) throw new Error('no addr');
+    upstreamUrl = `http://127.0.0.1:${addr.port}`;
+    gateway = new MockGateway();
+  });
+
+  afterEach(async () => {
+    await gateway.close();
+    await new Promise<void>((r) => upstream.close(() => r()));
+  });
+
+  it('connections 缺省 = 4：对 multiConn 网关建组，legCount 达到 4', async () => {
+    gateway.multiConnAck = { max: 16 };
+    gateway.attachOk = true;
+    const client = new Client({ upstreamUrl, gatewayUrl: gateway.url, hostname: 'pc-a' });
+    client.on('error', () => undefined);
+    await client.connect();
+    await vi.waitFor(() => expect(client.legCount).toBe(4));
+    await client.close();
+  });
+
+  it('connections: 1 = 纯 legacy：hello 不声明 multiConn', async () => {
+    const client = new Client({ upstreamUrl, gatewayUrl: gateway.url, hostname: 'pc-a', connections: 1 });
+    client.on('error', () => undefined);
+    await client.connect();
+    expect(client.legCount).toBe(1);
+    expect(gateway.lastHello?.client.multiConn).toBeUndefined();
+    await client.close();
+  });
+
+  it('多连接下帧完整性与顺序：大 echo 体经 4 leg 条带化后字节一致', async () => {
+    gateway.multiConnAck = { max: 16 };
+    gateway.attachOk = true;
+    const client = new Client({ upstreamUrl, gatewayUrl: gateway.url, hostname: 'pc-a' });
+    client.on('error', () => undefined);
+    await client.connect();
+    await vi.waitFor(() => expect(client.legCount).toBe(4));
+    const body = Buffer.alloc(2 * 1024 * 1024);
+    for (let i = 0; i < body.length; i++) body[i] = i % 251; // 可校验模式
+    const res = await gateway.request('POST', '/', {}, body); // upstream echo
+    expect(res.body.equals(body)).toBe(true);
+    await client.close();
   });
 });

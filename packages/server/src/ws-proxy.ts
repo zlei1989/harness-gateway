@@ -25,6 +25,8 @@ export interface ProxyContext {
   sessions: BrowserSessionStore;
   selectPath: string;
   headTimeoutMs: number;
+  /** 瞬断宽限（毫秒）：隧道离线时 WS upgrade 挂起等重连，耗尽才 502；0 = 即时 502 旧行为 */
+  tunnelRestoreGraceMs: number;
   logger: Logger;
 }
 
@@ -75,13 +77,13 @@ function sanitizeCloseReason(reason: string | undefined): string | undefined {
 }
 
 /** 浏览器 WS upgrade 入口（非保留路径） */
-export function handleBrowserWs(
+export async function handleBrowserWs(
   req: IncomingMessage,
   socket: Duplex,
   head: Buffer,
   browserWss: WebSocketServer,
   ctx: ProxyContext,
-): void {
+): Promise<void> {
   // 裸 socket error 消化（线上事故修复）：http.Server 'upgrade' 交出的 socket 上
   // Node 不保留任何 error 监听（Node 26 实测 listenerCount('error')===0），
   // accept 等待窗/拒绝回写期间对端 RST 的 ECONNRESET 会以未处理 'error' 事件崩进程。
@@ -98,9 +100,21 @@ export function handleBrowserWs(
     writeRawResponse(socket, 401, { 'content-type': 'text/plain; charset=utf-8' }, Buffer.from('unauthorized'));
     return;
   }
-  const tunnel = ctx.tunnels.get(session.tunnelId);
+  let tunnel = ctx.tunnels.get(session.tunnelId);
+  if (!tunnel && ctx.tunnelRestoreGraceMs > 0) {
+    // 瞬断宽限（spec §8）：WS upgrade 挂起等重连；等待期间浏览器断开（socket close）则放弃等待
+    ctx.logger.info('隧道离线，WS 升级宽限等待', { hostname: session.hostname, graceMs: ctx.tunnelRestoreGraceMs });
+    const browserGone = new Promise<null>((resolve) => socket.once('close', () => resolve(null)));
+    tunnel = (await Promise.race([
+      ctx.tunnels.waitFor(session.tunnelId, ctx.tunnelRestoreGraceMs),
+      browserGone,
+    ])) ?? undefined;
+    if (tunnel) ctx.logger.info('隧道已恢复，继续 WS 升级', { hostname: session.hostname });
+  }
   if (!tunnel) {
-    writeRawResponse(socket, 502, { 'content-type': 'text/plain; charset=utf-8' }, Buffer.from('tunnel offline'));
+    if (!socket.destroyed) {
+      writeRawResponse(socket, 502, { 'content-type': 'text/plain; charset=utf-8' }, Buffer.from('tunnel offline'));
+    }
     return;
   }
 

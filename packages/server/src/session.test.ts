@@ -8,6 +8,7 @@ import { EventEmitter } from 'node:events';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { decodeData } from './protocol';
 import { type PendingChannel, TunnelRegistry, TunnelSession } from './session';
 
 import type { ControlFrame, DataHeader } from './protocol';
@@ -27,15 +28,39 @@ function makeLogger() {
   return { logger, errors };
 }
 
-/** 假 ws：记录发送内容，可触发事件 */
+/** 假 ws：记录发送内容，可触发事件；close 首写胜出（对齐真实 ws：已关再 close 为 no-op） */
 class FakeWs extends EventEmitter {
   sent: (string | Buffer)[] = [];
   bufferedAmount = 0;
   closed: { code?: number; reason?: string } | null = null;
   send(data: string | Buffer): void { this.sent.push(data); }
-  close(code?: number, reason?: string): void { this.closed = { code, reason }; }
-  terminate(): void { this.closed = { code: 1006 }; }
+  close(code?: number, reason?: string): void { if (!this.closed) this.closed = { code, reason }; }
+  terminate(): void { if (!this.closed) this.closed = { code: 1006 }; }
   asWs(): WebSocket { return this as unknown as WebSocket; }
+}
+
+/** 多 leg 测试最小假 ws：send/bufferedAmount/close/closed + sent 台账（控制帧存解析后 JSON，数据帧存原始 Buffer） */
+function fakeWs(): WebSocket & {
+  sent: Array<Buffer | { type?: string; seq?: number }>;
+  bufferedAmount: number;
+  closed: boolean;
+} {
+  const sent: Array<Buffer | { type?: string; seq?: number }> = [];
+  const ws = {
+    sent,
+    bufferedAmount: 0,
+    closed: false,
+    send(data: string | Buffer): void {
+      sent.push(Buffer.isBuffer(data) ? data : (JSON.parse(data) as { type?: string; seq?: number }));
+    },
+    close(): void { ws.closed = true; },
+  };
+  return ws as unknown as WebSocket & { sent: typeof sent; bufferedAmount: number; closed: boolean };
+}
+
+const isData = (f: unknown): f is Buffer => Buffer.isBuffer(f);
+function seqOf(f: Buffer | { seq?: number }): number | undefined {
+  return Buffer.isBuffer(f) ? decodeData(f).header.seq : f.seq;
 }
 
 function makeChannel(kind: 'http' | 'ws' = 'http') {
@@ -63,7 +88,7 @@ describe('TunnelSession', () => {
     expect(session.register(a.channel)).toBe(1);
     expect(session.register(makeChannel().channel)).toBe(2);
     session.unregister(1);
-    session.handleControl({ type: 'http.head', channelId: 1, status: 200, headers: {} });
+    session.handleControl({ type: 'http.head', channelId: 1, status: 200, headers: {} }, session.primaryLeg);
     expect(a.calls.control).toHaveLength(0); // 已注销不再路由
   });
 
@@ -71,34 +96,34 @@ describe('TunnelSession', () => {
     const { session } = makeSession();
     const a = makeChannel();
     const id = session.register(a.channel);
-    session.handleControl({ type: 'http.head', channelId: id, status: 200, headers: {} });
-    session.handleData({ channelId: id, kind: 'http.body' }, Buffer.from('x'));
+    session.handleControl({ type: 'http.head', channelId: id, status: 200, headers: {} }, session.primaryLeg);
+    session.handleData({ channelId: id, kind: 'http.body' }, Buffer.from('x'), session.primaryLeg, 10);
     expect(a.calls.control[0]).toMatchObject({ type: 'http.head', status: 200 });
     expect(a.calls.data[0]?.kind).toBe('http.body');
   });
 
   it('ping 自动回 pong，不上抛通道', () => {
     const { session, ws } = makeSession();
-    session.handleControl({ type: 'ping' });
+    session.handleControl({ type: 'ping' }, session.primaryLeg);
     expect(String(ws.sent[0])).toBe(JSON.stringify({ type: 'pong' }));
   });
 
   it('tunnel.ack 流量回执：声明 flowControl 后按 128KiB 节拍回累计字节；未声明不回执', () => {
     // 未声明 flowControl（老客户端）：任何数据量都不回执（防未知帧坏帧预算误杀对端）
     const { session, ws } = makeSession();
-    session.noteDataReceived(200 * 1024);
+    session.primaryLeg.noteDataReceived(200 * 1024);
     expect(ws.sent).toHaveLength(0);
     // 声明后：按 ACK_EVERY_BYTES(128KiB) 节拍回执累计字节数（含帧头口径，由 tunnel.ts 记账）
     const ws2 = new FakeWs();
     const s2 = new TunnelSession(
       ws2.asWs(), { tunnelId: 't-2', hostname: 'pc-b', defaultPath: '/', flowAck: true }, nullLogger, () => {},
     );
-    s2.noteDataReceived(100 * 1024); // 不足 128KiB：不回
+    s2.primaryLeg.noteDataReceived(100 * 1024); // 不足 128KiB：不回
     expect(ws2.sent).toHaveLength(0);
-    s2.noteDataReceived(50 * 1024); // 累计 150KiB ≥ 128KiB：回执累计值
+    s2.primaryLeg.noteDataReceived(50 * 1024); // 累计 150KiB ≥ 128KiB：回执累计值
     expect(ws2.sent).toHaveLength(1);
     expect(JSON.parse(String(ws2.sent[0]))).toEqual({ type: 'tunnel.ack', bytes: 150 * 1024 });
-    s2.noteDataReceived(200 * 1024); // 距上次回执 200KiB ≥ 128KiB：再次回执
+    s2.primaryLeg.noteDataReceived(200 * 1024); // 距上次回执 200KiB ≥ 128KiB：再次回执
     expect(ws2.sent).toHaveLength(2);
     expect(JSON.parse(String(ws2.sent[1]))).toEqual({ type: 'tunnel.ack', bytes: 350 * 1024 });
   });
@@ -108,7 +133,7 @@ describe('TunnelSession', () => {
     const s = new TunnelSession(
       ws.asWs(), { tunnelId: 't-3', hostname: 'pc-c', defaultPath: '/', flowAck: true }, nullLogger, () => {},
     );
-    s.noteDataReceived(64 * 1024); // 不足节拍：不立即回执
+    s.primaryLeg.noteDataReceived(64 * 1024); // 不足节拍：不立即回执
     expect(ws.sent).toHaveLength(0);
     await vi.waitFor(() => { expect(ws.sent).toHaveLength(1); }, { timeout: 3000 }); // 兜底定时器补回
     expect(JSON.parse(String(ws.sent[0]))).toEqual({ type: 'tunnel.ack', bytes: 64 * 1024 });
@@ -187,14 +212,65 @@ describe('TunnelSession', () => {
     a.channel.onData = () => { throw new Error('boom-data'); };
     const id = session.register(a.channel);
     expect(() =>
-      session.handleControl({ type: 'http.head', channelId: id, status: 200, headers: {} }),
+      session.handleControl({ type: 'http.head', channelId: id, status: 200, headers: {} }, session.primaryLeg),
     ).not.toThrow();
     expect(() =>
-      session.handleData({ channelId: id, kind: 'http.body' }, Buffer.from('x')),
+      session.handleData({ channelId: id, kind: 'http.body' }, Buffer.from('x'), session.primaryLeg, 10),
     ).not.toThrow();
     expect(errors).toHaveLength(2);
     expect(String(errors[0]?.context?.stack)).toContain('boom-control');
     expect(String(errors[1]?.context?.stack)).toContain('boom-data');
+  });
+
+  // ---- 多 leg（striped 模式；Task 7） ----
+
+  it('striped 会话：sendData 打 seq 并散落到多条 leg', () => {
+    const wsA = fakeWs(); const wsB = fakeWs();
+    const s = new TunnelSession(wsA, { tunnelId: 't1', hostname: 'h', defaultPath: '/', striped: true, maxLegs: 4 }, nullLogger, () => undefined);
+    s.attachLeg(wsB);
+    for (let i = 0; i < 4; i++) s.sendData({ channelId: 1, kind: 'http.body' }, Buffer.from('x'));
+    const seqsA = wsA.sent.filter(isData).map(seqOf); const seqsB = wsB.sent.filter(isData).map(seqOf);
+    expect([...seqsA, ...seqsB].sort()).toEqual([0, 1, 2, 3]); // seq 单调无洞
+  });
+
+  it('legacy 会话：不发 seq、只走首 leg', () => {
+    const wsA = fakeWs();
+    const s = new TunnelSession(wsA, { tunnelId: 't1', hostname: 'h', defaultPath: '/' }, nullLogger, () => undefined);
+    s.sendData({ channelId: 1, kind: 'http.body' }, Buffer.from('x'));
+    expect(seqOf(wsA.sent[0] as Buffer)).toBeUndefined();
+  });
+
+  it('任一 leg 断 = 整组 teardown：全部通道 onTunnelDown + onDown 一次', () => {
+    const wsA = fakeWs(); const wsB = fakeWs();
+    let down = 0;
+    const s = new TunnelSession(wsA, { tunnelId: 't1', hostname: 'h', defaultPath: '/', striped: true, maxLegs: 4 }, nullLogger, () => { down += 1; });
+    const legB = s.attachLeg(wsB);
+    const torn: number[] = [];
+    s.register({ kind: 'http', onControl: () => undefined, onData: () => undefined, onTunnelDown: () => torn.push(1) });
+    s.legDown(legB);
+    expect(torn).toEqual([1]);
+    expect(down).toBe(1);
+    expect(wsB.closed).toBe(true);
+  });
+
+  it('per-leg ack：attach leg 收到的字节只在该 leg 上回执', () => {
+    const wsA = fakeWs(); const wsB = fakeWs();
+    const s = new TunnelSession(wsA, { tunnelId: 't1', hostname: 'h', defaultPath: '/', flowAck: true, striped: true, maxLegs: 4 }, nullLogger, () => undefined);
+    const legB = s.attachLeg(wsB);
+    s.handleData({ channelId: 1, kind: 'http.body' }, Buffer.alloc(200 * 1024), legB, 200 * 1024 + 64);
+    expect(wsB.sent.some((f) => !Buffer.isBuffer(f) && f.type === 'tunnel.ack')).toBe(true);
+    expect(wsA.sent.some((f) => !Buffer.isBuffer(f) && f.type === 'tunnel.ack')).toBe(false);
+  });
+
+  it('乱序入站经 Resequencer 按序交付通道', () => {
+    const wsA = fakeWs();
+    const s = new TunnelSession(wsA, { tunnelId: 't1', hostname: 'h', defaultPath: '/', striped: true, maxLegs: 4 }, nullLogger, () => undefined);
+    const got: string[] = [];
+    s.register({ kind: 'http', onControl: () => undefined, onData: (_h, p) => got.push(p.toString()), onTunnelDown: () => undefined });
+    const leg = s.primaryLeg;
+    s.handleData({ channelId: 1, kind: 'http.body', seq: 1 }, Buffer.from('b'), leg, 10);
+    s.handleData({ channelId: 1, kind: 'http.body', seq: 0 }, Buffer.from('a'), leg, 10);
+    expect(got).toEqual(['a', 'b']);
   });
 });
 
@@ -223,5 +299,33 @@ describe('TunnelRegistry', () => {
     registry.set('tid-2', b);
     expect(registry.list().map((s) => s.hostname)).toEqual(['pc-a', 'pc-a']);
     expect(registry.get('tid-2')).toBe(b);
+  });
+});
+
+describe('TunnelRegistry.waitFor（瞬断宽限）', () => {
+  it('已在立即返回；上线唤醒；超时 null；teardownAll 唤醒 null', async () => {
+    const registry = new TunnelRegistry();
+    const { session } = makeSession(); // 复用文件内既有 session 构造助手
+    // 已在
+    registry.set('tid-1', session);
+    await expect(registry.waitFor('tid-1', 50)).resolves.toBe(session);
+    registry.delete('tid-1', session);
+    // 上线唤醒
+    const pending = registry.waitFor('tid-2', 1000);
+    registry.set('tid-2', session);
+    await expect(pending).resolves.toBe(session);
+    // 超时 null
+    await expect(registry.waitFor('tid-3', 50)).resolves.toBeNull();
+    // teardownAll 唤醒 null
+    const hanging = registry.waitFor('tid-4', 60_000);
+    registry.teardownAll();
+    await expect(hanging).resolves.toBeNull();
+  });
+
+  it('closeAll 唤醒全部等待方 null（服务端关停不得悬挂浏览器请求）', async () => {
+    const registry = new TunnelRegistry();
+    const hanging = registry.waitFor('tid-x', 60_000);
+    registry.closeAll();
+    await expect(hanging).resolves.toBeNull();
   });
 });

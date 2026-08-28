@@ -12,6 +12,8 @@ import { type AuthDecision, type AuthorizationHook, type AuthRequest, runAuthori
 import { Connection, type ReconnectOptions } from './connection';
 import { HttpChannel } from './http-channel';
 import { createDefaultLogger, type Logger } from './logger';
+import { Resequencer } from './resequencer';
+import { TunnelGroup } from './tunnel-group';
 import { WsChannel } from './ws-channel';
 
 import type { ChannelErrorFrame, ControlFrame, DataHeader } from './protocol';
@@ -38,6 +40,11 @@ export interface ClientOptions {
   heartbeatIntervalMs?: number;
   authTimeoutMs?: number;
   connectTimeoutMs?: number;
+  /**
+   * 隧道连接数（spec §8）：默认 4，clamp [1,16]。>1 时建 TunnelGroup 条带化传输；
+   * 1 = 纯 legacy 单连接（连 multiConn 协商都不发）。老服务端自动降级单连接。
+   */
+  connections?: number;
   logger?: Logger;
 }
 
@@ -51,7 +58,9 @@ type AnyChannel = HttpChannel | WsChannel;
 const CLOSING_DRAIN_MS = 50;
 
 export class Client extends EventEmitter {
-  private readonly connection: Connection;
+  private readonly connection: Connection | TunnelGroup;
+  private readonly resequencer: Resequencer;
+  private readonly connectionCount: number;
   private readonly channels = new Map<number, AnyChannel>();
   private readonly upstream: URL;
   /**
@@ -99,29 +108,45 @@ export class Client extends EventEmitter {
         timeoutMs: authTimeoutMs,
       });
 
-    this.connection = new Connection(
-      {
-        gatewayUrl: options.gatewayUrl,
-        hello: { hostname: options.hostname, defaultPath: options.defaultPath ?? '/' },
-        heartbeatIntervalMs: options.heartbeatIntervalMs ?? 30_000,
-        connectTimeoutMs: options.connectTimeoutMs ?? 60_000,
-        reconnect: {
-          baseDelayMs: options.reconnect?.baseDelayMs ?? 1000,
-          maxDelayMs: options.reconnect?.maxDelayMs ?? 30_000,
-          maxRetries: options.reconnect?.maxRetries ?? Infinity,
-        },
-        logger: this.logger,
+    // 多连接装配（spec §8）：==1 走纯 legacy 单 Connection；>1 建 TunnelGroup 条带化。
+    // connections clamp [1,16]，NaN/非有限值按默认 4。
+    const raw = options.connections ?? 4;
+    this.connectionCount = Number.isFinite(raw) ? Math.min(16, Math.max(1, Math.floor(raw))) : 4;
+    const connOpts = {
+      gatewayUrl: options.gatewayUrl,
+      hello: { hostname: options.hostname, defaultPath: options.defaultPath ?? '/' },
+      heartbeatIntervalMs: options.heartbeatIntervalMs ?? 30_000,
+      connectTimeoutMs: options.connectTimeoutMs ?? 60_000,
+      reconnect: {
+        baseDelayMs: options.reconnect?.baseDelayMs ?? 1000,
+        maxDelayMs: options.reconnect?.maxDelayMs ?? 30_000,
+        maxRetries: options.reconnect?.maxRetries ?? Infinity,
       },
-      {
-        onControl: (frame) => this.onControl(frame),
-        onData: (header, payload) => this.onData(header, payload),
-        onDisconnected: () => this.abortAllChannels(),
+      logger: this.logger,
+    };
+    const handlers = {
+      onControl: (frame: ControlFrame) => this.ingestControl(frame),
+      onData: (header: DataHeader, payload: Buffer) => this.ingestData(header, payload),
+      onDisconnected: () => this.abortAllChannels(),
+    };
+    this.connection = this.connectionCount === 1
+      ? new Connection(connOpts, handlers)
+      : new TunnelGroup({ ...connOpts, connections: this.connectionCount }, handlers);
+    // 接收端重排序（spec §6）：多连接条带化帧可能跨 leg 乱序到达，按 seq 重排后再分发；
+    // 缓冲超限 = 对端行为异常，整组重连（断腿=整组重建前提下由重连归零 seq 空间自愈）
+    this.resequencer = new Resequencer({
+      logger: this.logger,
+      onOverflow: (channelId) => {
+        this.logger.error('重排序缓冲超限，整组重连', { channelId });
+        this.connection.forceReconnect();
       },
-    );
+    });
     this.connection.on('error', (err: Error) => {
       this.logger.error('隧道连接错误', { error: err.stack ?? err.message });
       this.emit('error', err);
     });
+    // 终态失败透传（不再重连：4409 / 重连耗尽）；瞬时 ws 错误只走 'error'，由重连收敛
+    this.connection.on('fatal', (err: Error) => this.emit('fatal', err));
     this.connection.on('connected', () => this.emit('connected'));
     this.connection.on('disconnected', () => this.emit('disconnected'));
   }
@@ -134,6 +159,11 @@ export class Client extends EventEmitter {
   /** 服务端分配的 tunnelId（hello.ack 后可用）；用户据此拼 select?tunnelId= 深链 */
   get tunnelId(): string | undefined {
     return this.connection.tunnelId;
+  }
+
+  /** 当前就绪 leg 数（多连接观测/e2e 断言用；单连接恒 1） */
+  get legCount(): number {
+    return this.connection instanceof TunnelGroup ? this.connection.readyLegCount : 1;
   }
 
   /** 优雅关闭：拒收新 open（回执窗口）→ 关隧道（服务端随即注销 hostname）→ 中止在途通道 → 收走连接池 */
@@ -149,8 +179,32 @@ export class Client extends EventEmitter {
     this.agent.destroy();
   }
 
+  /** 控制帧 ingest 入口：带 seq 的通道级帧（多连接条带化）进 Resequencer 重排，其余直通分发 */
+  private ingestControl(frame: ControlFrame): void {
+    const channelId = 'channelId' in frame ? frame.channelId : undefined;
+    const seq = 'seq' in frame ? frame.seq : undefined;
+    if (channelId !== undefined && typeof seq === 'number') {
+      this.resequencer.feed(channelId, seq, { kind: 'control', frame }, (item) => {
+        if (item.kind === 'control') this.dispatchControl(item.frame);
+      });
+      return;
+    }
+    this.dispatchControl(frame);
+  }
+
+  /** 数据帧 ingest 入口：带 seq 的帧进 Resequencer 重排，其余直通分发 */
+  private ingestData(header: DataHeader, payload: Buffer): void {
+    if (typeof header.seq === 'number') {
+      this.resequencer.feed(header.channelId, header.seq, { kind: 'data', header, payload }, (item) => {
+        if (item.kind === 'data') this.dispatchData(item.header, item.payload);
+      });
+      return;
+    }
+    this.dispatchData(header, payload);
+  }
+
   /** 控制帧路由：hello.ack/ping/pong 已被 Connection 消化 */
-  private onControl(frame: ControlFrame): void {
+  private dispatchControl(frame: ControlFrame): void {
     switch (frame.type) {
       case 'http.open': {
         this.openHttp(frame);
@@ -176,7 +230,7 @@ export class Client extends EventEmitter {
   }
 
   /** 数据帧路由：未知 channelId 丢弃（对端已关闭的迟到帧属正常竞态） */
-  private onData(header: DataHeader, payload: Buffer): void {
+  private dispatchData(header: DataHeader, payload: Buffer): void {
     const channel = this.channels.get(header.channelId);
     if (!channel) {
       this.logger.debug('未知通道数据帧，丢弃', { channelId: header.channelId, kind: header.kind });
@@ -197,7 +251,7 @@ export class Client extends EventEmitter {
       id: frame.channelId, open: frame, upstream: this.upstream,
       connection: this.connection, authorize: this.authorize, logger: this.logger,
       agent: this.agent, compress: this.compress,
-      onDone: (id) => this.channels.delete(id),
+      onDone: (id) => { this.channels.delete(id); this.resequencer.dropChannel(id); },
     });
     this.channels.set(frame.channelId, channel);
     void channel.start().catch((err: unknown) => {
@@ -214,7 +268,7 @@ export class Client extends EventEmitter {
     const channel = new WsChannel({
       id: frame.channelId, open: frame, upstream: this.upstream,
       connection: this.connection, authorize: this.authorize, logger: this.logger,
-      onDone: (id) => this.channels.delete(id),
+      onDone: (id) => { this.channels.delete(id); this.resequencer.dropChannel(id); },
     });
     this.channels.set(frame.channelId, channel);
     void channel.start().catch((err: unknown) => {
@@ -228,8 +282,9 @@ export class Client extends EventEmitter {
     const all = [...this.channels.values()];
     this.channels.clear();
     for (const channel of all) channel.abort();
+    this.resequencer.reset(); // channelId 空间随隧道重建归零，重排序状态一并清空
   }
 }
 
-// ChannelErrorFrame 仅用于类型完备性（onControl switch 内联收窄）
+// ChannelErrorFrame 仅用于类型完备性（dispatchControl switch 内联收窄）
 export type { ChannelErrorFrame };

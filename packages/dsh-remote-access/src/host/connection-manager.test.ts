@@ -26,9 +26,12 @@ vi.mock('gateway-client', async (importOriginal) => {
 /** 最小 mock 网关：讲隧道控制帧的 ws 服务端（控制帧为 JSON 文本帧）。 */
 class HelloMockGateway {
   private wss = new WebSocketServer({ port: 0 });
+  private sockets = new Set<import('ws').WebSocket>();
 
   constructor(private readonly tunnelId = 'tid-test-1') {
     this.wss.on('connection', (ws) => {
+      this.sockets.add(ws);
+      ws.on('close', () => this.sockets.delete(ws));
       ws.on('message', (raw, isBinary) => {
         if (isBinary) return;
         const frame = JSON.parse(String(raw)) as { type?: string };
@@ -45,6 +48,18 @@ class HelloMockGateway {
     const addr = this.wss.address();
     if (typeof addr === 'string' || addr === null) throw new Error('no addr');
     return `ws://127.0.0.1:${addr.port}`;
+  }
+
+  /**
+   * 模拟线上中间件 synthesized 的非法 close 帧（code 1006 是保留字，ws 库自身发不出）：
+   * 绕过 ws 直接往裸 socket 写 close 帧（FIN|opcode 0x8，2 字节负载 0x03EE=1006），
+   * 客户端 ws 收帧即抛 "Invalid WebSocket frame: invalid status code 1006"（线上报错原文）
+   */
+  sendIllegalCloseFrame(): void {
+    for (const ws of this.sockets) {
+      (ws as unknown as { _socket: import('node:net').Socket })._socket
+        .write(Buffer.from([0x88, 0x02, 0x03, 0xee]));
+    }
   }
 
   async close(): Promise<void> {
@@ -98,8 +113,32 @@ describe('ConnectionManager', () => {
     expect(capturedClientOptions[1]).toMatchObject({ compress: true });
   });
 
+  it('enable 将 connections 原样透传给 gateway-client 构造参数（缺省传 undefined，Client 默认 4）', async () => {
+    capturedClientOptions.length = 0;
+    await manager.enable({ ...cfg(gateway.url), connections: 8 });
+    await manager.enable(cfg(gateway.url));
+    expect(capturedClientOptions[0]).toMatchObject({ connections: 8 });
+    expect(capturedClientOptions[1]?.connections).toBeUndefined();
+  });
+
   it('非法网关地址：enable 抛错，状态保持 off', async () => {    await expect(manager.enable(cfg(''))).rejects.toThrow(/不能为空/);
     expect(manager.status.state).toBe('off');
+  });
+
+  it('隧道被中间件非法 close 帧（1006）杀掉：回 connecting 自动重连恢复，不误落 error（线上回归）', async () => {
+    await manager.enable(cfg(gateway.url));
+    expect(manager.status.state).toBe('connected');
+    gateway.sendIllegalCloseFrame();
+    // 断开回落 connecting（内建重连退避 0.5-1s，窗口足够 waitFor 捕获）。
+    // 旧行为：瞬时 ws error 直接落 error 终态且 disconnected 不降级，
+    // UI 卡「连接失败：Invalid WebSocket frame: invalid status code 1006」直至重连成功
+    await vi.waitFor(() => expect(manager.status.state).toBe('connecting'), { timeout: 2000 });
+    expect(manager.status.state).not.toBe('error');
+    // 内建重连自动恢复，deepLink/tunnelId 随之回来
+    await vi.waitFor(() => {
+      expect(manager.status.state).toBe('connected');
+      expect(manager.status.tunnelId).toBe('tid-test-1');
+    }, { timeout: 10000 });
   });
 
   it('连接失败（网关不可达）：状态进入 error 而非悬挂', async () => {

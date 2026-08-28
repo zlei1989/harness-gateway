@@ -6,12 +6,13 @@
  * - 时序断言（断开清理）需留出宏任务窗口（setTimeout）。
  */
 
+import { randomUUID } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
 
-import { type ControlFrame, encodeControl } from './protocol';
+import { type ControlFrame, encodeControl, type HelloAckFrame } from './protocol';
 import { TunnelRegistry } from './session';
 import { attachTunnelHandler } from './tunnel';
 
@@ -21,6 +22,8 @@ const nullLogger = { debug() {}, info() {}, warn() {}, error() {} } as unknown a
 
 let httpServer: Server | null = null;
 let port = 0;
+/** 最近一次 setup 的服务端视图（attach 用例断言注册表用） */
+let server: { tunnels: TunnelRegistry };
 /** 本用例产生的全部客户端连接，afterEach 统一 terminate 防挂起 */
 const clients: WebSocket[] = [];
 /** 服务端侧 socket 台账：upgrade 交还路径的悬挂 socket 不被 server.close 回收，需手动销毁 */
@@ -37,6 +40,7 @@ afterEach(async () => {
 
 async function setup(helloTimeoutMs = 200, logger: import('./logger').Logger = nullLogger): Promise<TunnelRegistry> {
   const tunnels = new TunnelRegistry();
+  server = { tunnels }; // attach 用例经 server.tunnels 断言注册表
   httpServer = createServer();
   httpServer.on('connection', (s) => {
     serverSockets.add(s);
@@ -273,5 +277,90 @@ describe('隧道接入', () => {
     expect(pong).toEqual({ type: 'pong' });
     expect(tunnels.has(id)).toBe(true);
     ws.close();
+  });
+});
+
+// ---- Task 8：attach 握手（多连接隧道组）最小驱动 ----
+
+/** 建连 → 等 open → 发 hello（可声明 multiConn 协商或 attach 加入既有组） */
+async function dialTunnel(client: {
+  hostname: string;
+  defaultPath: string;
+  tunnelId?: string;
+  multiConn?: { count: number };
+  attach?: boolean;
+}): Promise<WebSocket> {
+  const ws = connectWs();
+  await new Promise<void>((r) => ws.on('open', r));
+  ws.send(encodeControl({ type: 'hello', client }));
+  return ws;
+}
+
+/** 取下一条控制帧（hello.ack——本组用例首条下行帧恒为 ack） */
+function nextControl(ws: WebSocket): Promise<HelloAckFrame> {
+  return new Promise((r) => ws.once('message', (d) => r(JSON.parse(String(d)) as HelloAckFrame)));
+}
+
+/** 等连接关闭，返回关闭码 */
+function nextClose(ws: WebSocket): Promise<number> {
+  return new Promise((r) => ws.on('close', (c) => r(c)));
+}
+
+describe('隧道 attach 握手', () => {
+  it('协商 multiConn 的 primary：hello.ack 回 multiConn.max', async () => {
+    await setup();
+    const ws = await dialTunnel({ hostname: 'pc-a', defaultPath: '/', multiConn: { count: 4 } });
+    const ack = await nextControl(ws);
+    expect(ack).toMatchObject({ type: 'hello.ack', multiConn: { max: 4 } });
+    ws.close();
+  });
+
+  it('attach 成功：回带在线 striped 隧道 id → ack 同一 tunnelId 入组', async () => {
+    await setup();
+    const wsA = await dialTunnel({ hostname: 'pc-a', defaultPath: '/', multiConn: { count: 4 } });
+    const ackA = await nextControl(wsA);
+    const wsB = await dialTunnel({ hostname: 'pc-a', defaultPath: '/', attach: true, tunnelId: ackA.tunnelId });
+    const ackB = await nextControl(wsB);
+    expect(ackB.tunnelId).toBe(ackA.tunnelId);
+    wsA.close(); wsB.close();
+  });
+
+  it('attach 目标不存在/legacy 会话/组满 → 4410', async () => {
+    await setup();
+    // 不存在
+    const ws1 = await dialTunnel({ hostname: 'x', defaultPath: '/', attach: true, tunnelId: randomUUID() });
+    await expect(nextClose(ws1)).resolves.toBe(4410);
+    // legacy 会话（未声明 multiConn）
+    const wsA = await dialTunnel({ hostname: 'pc-l', defaultPath: '/' });
+    const ackA = await nextControl(wsA);
+    const ws2 = await dialTunnel({ hostname: 'pc-l', defaultPath: '/', attach: true, tunnelId: ackA.tunnelId });
+    await expect(nextClose(ws2)).resolves.toBe(4410);
+    wsA.close();
+  });
+
+  it('组满：count:2 隧道挂满 2 leg 后再 attach → 4410（组内既有 leg 不受影响）', async () => {
+    await setup();
+    const wsA = await dialTunnel({ hostname: 'pc-f', defaultPath: '/', multiConn: { count: 2 } });
+    const ackA = await nextControl(wsA);
+    const wsB = await dialTunnel({ hostname: 'pc-f', defaultPath: '/', attach: true, tunnelId: ackA.tunnelId });
+    await nextControl(wsB);
+    const ws3 = await dialTunnel({ hostname: 'pc-f', defaultPath: '/', attach: true, tunnelId: ackA.tunnelId });
+    await expect(nextClose(ws3)).resolves.toBe(4410);
+    // 组仍健康：primary 回 ping 正常
+    wsA.send(encodeControl({ type: 'ping' }));
+    const pong = await nextControl(wsA) as unknown as ControlFrame;
+    expect(pong).toEqual({ type: 'pong' });
+    wsA.close(); wsB.close();
+  });
+
+  it('attach leg 断开 → 整隧道注销（registry 不再持有）', async () => {
+    await setup();
+    const wsA = await dialTunnel({ hostname: 'pc-g', defaultPath: '/', multiConn: { count: 2 } });
+    const ackA = await nextControl(wsA);
+    const wsB = await dialTunnel({ hostname: 'pc-g', defaultPath: '/', attach: true, tunnelId: ackA.tunnelId });
+    await nextControl(wsB);
+    wsB.terminate();
+    await vi.waitFor(() => expect(server.tunnels.has(ackA.tunnelId)).toBe(false));
+    wsA.close();
   });
 });

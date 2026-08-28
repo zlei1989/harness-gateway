@@ -141,8 +141,10 @@ describe('handleSelectPost（经真实 HTTP）', () => {
     const cookie = res.headers.get('set-cookie') ?? '';
     expect(cookie).toContain('gateway_sid=');
     expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('Max-Age=');
     const uuid = /gateway_sid=([^;]+)/.exec(cookie)?.[1] ?? '';
-    expect(sessions.get(uuid)).toEqual({ tunnelId: 'tid-1', hostname: 'pc-a', token: 'good' });
+    // 会话现含 expiresAt（TTL），结构匹配用 toMatchObject
+    expect(sessions.get(uuid)).toMatchObject({ tunnelId: 'tid-1', hostname: 'pc-a', token: 'good' });
   });
 
   it('错误 token → 403 JSON error（对话框内展示，不重渲染页面）', async () => {

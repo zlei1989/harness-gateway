@@ -303,7 +303,9 @@ export async function handleSelectPost(
     const target = tunnel.defaultPath.startsWith('/') && !tunnel.defaultPath.startsWith('//')
       ? tunnel.defaultPath
       : '/';
-    sendJson(res, 200, { ok: true, redirect: target }, { 'set-cookie': buildSessionCookie(uuid) });
+    sendJson(res, 200, { ok: true, redirect: target }, {
+      'set-cookie': buildSessionCookie(uuid, Math.floor(ctx.sessions.ttlMs / 1000)),
+    });
     return;
   }
   if (result === 'timeout') {

@@ -33,6 +33,15 @@ describe('parseArgs', () => {
     expect(() => parseArgs(['--keep-alive-timeout-ms', '0'])).toThrow(/keep-alive-timeout-ms/);
     expect(() => parseArgs(['--keep-alive-timeout-ms'])).toThrow(/keep-alive-timeout-ms/);
   });
+  it('解析 --session-store / --browser-session-ttl', () => {
+    const args = parseArgs(['--session-store', '/tmp/s.json', '--browser-session-ttl', '3600000']);
+    expect(args.sessionStorePath).toBe('/tmp/s.json');
+    expect(args.browserSessionTtlMs).toBe(3600000);
+  });
+  it('--browser-session-ttl 非法值抛错', () => {
+    expect(() => parseArgs(['--browser-session-ttl', '0'])).toThrow('--browser-session-ttl 非法');
+    expect(() => parseArgs(['--browser-session-ttl', 'abc'])).toThrow('--browser-session-ttl 非法');
+  });
   it('未知参数抛错', () => {
     expect(() => parseArgs(['--nope'])).toThrow(/未知参数/);
   });

@@ -44,6 +44,10 @@ pnpm run server --port 9000   # 省略 --port 时默认 9000
 | `--select-path` | `/__gateway__/select` | 内置选择页路径 |
 | `--tunnel-permessage-deflate` | 关闭 | 隧道 WS 开启 permessage-deflate 压缩（≥1KB 帧才压缩，SSE 小帧不受影响）；跨机房/跨境部署建议开启，显著降低高 RTT 链路传输时间，代价是两端少量 CPU |
 | `--keep-alive-timeout-ms` | `5000` | 浏览器侧 HTTP keep-alive 空闲超时（毫秒，须正整数）；高 RTT 链路建议调大（如 `60000`）让浏览器连接跨页面间隙复用，减少每次新建 TCP 的握手往返。headersTimeout 自动抬到该值之上 |
+| `--session-store` | 无（纯内存） | 浏览器会话快照落盘路径；配置后服务端重启可从快照恢复会话，浏览器免重新选择 |
+| `--browser-session-ttl` | `604800000`（7 天） | 浏览器会话生存期（毫秒，须正整数）；cookie `Max-Age` 与其同源，cookie 与服务端会话同时到期无悬空态 |
+
+> 快照安全备注：`--session-store` 快照为**明文 JSON（含各隧道 token）**，落盘权限 0600（POSIX 严格 owner-only；Windows 上 Node 文件 mode 为 best-effort，实际生效靠 ACL）——部署者须妥善保护该文件。
 
 慢链路排查：服务端按请求记录 `请求完成` 日志（INFO），字段含 `headMs`（入口→收到响应头，即隧道往返+upstream 首字节延迟）与 `totalMs - headMs`（≈body 流式传输耗时）、`bodyBytes`、`status`，可据此定位慢在隧道往返还是带宽。
 
@@ -61,6 +65,8 @@ export default {
   compress: true,                        // 可选：压缩传输（默认 false），为 upstream 未压缩的
                                          // 可压缩响应代做 br/gzip 端到端压缩；大文本日志传输量
                                          // 可降一个数量级；SSE/Range/已编码/小响应自动透传
+  connections: 4,                          // 可选：隧道连接数（默认 4，1=单连接 legacy 模式）；
+                                           // 多连接条带化提升大传输吞吐，老服务端自动降级单连接
 }
 ```
 
@@ -75,7 +81,11 @@ pnpm client
 1. 打开 `http://<网关地址>:9000/`，无会话时自动 302 到选择页
 2. 点击目标电脑图标，输入该机的 token
 3. 验证通过后跳转该电脑的 `defaultPath`，后续请求经隧道直达本机服务
-4. 退出 = 关闭浏览器（session cookie 失效）
+4. 会话生命周期（cookie `gateway_sid` 带 `Max-Age`，与服务端 TTL 同源，默认 7 天）：
+   - 隧道瞬断 → 自动恢复，浏览器无感
+   - 关闭/重开浏览器 → `Max-Age` 内免重新登录
+   - 服务端重启 → 仅当配置了 `--session-store`（快照恢复）才免重登，否则需重新选择
+   - 客户端进程退出 → 会话作废，需重新选择
 
 ## 鉴权
 
@@ -103,6 +113,12 @@ export default {
 - **TLS 交给前置反代**（nginx/caddy）：网关只讲 HTTP/WS，此时 `gatewayUrl` 改用 `wss://`
 - token 随转发请求流经隧道，公网部署**务必前置 TLS**
 - 隧道接入本身无认证，公网建议再加一层前置保护
+- **心跳间隔必须小于链路上最短的中间盒空闲超时**（Nginx `proxy_read_timeout` 默认 60s、
+  Cloudflare ≈100s、家用 NAT 通常小时级、移动 CGNAT 可短至数分钟）。客户端默认 30s
+  应用层 ping 可覆盖绝大多数场景；部署在空闲超时 <30s 的反代后时，必须用
+  `heartbeatIntervalMs` 调小客户端心跳，否则隧道会被周期性回收（表现：规律性 1006 重连）。
+- 反代必须为隧道路径开启 WS Upgrade 转发（Nginx：`proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";`），否则客户端报 `Unexpected server response`。
 
 ## 开发命令
 
@@ -122,6 +138,7 @@ export default {
 packages/
 ├── server/   # gateway-server — 网关服务端：选择页、会话、路由、HTTP/WS 双向桥接
 ├── client/   # gateway-client — 网关客户端：出站连网关、鉴权、还原流量到本地 upstream
+├── chaos-proxy/        # chaos-proxy — TCP 故障注入代理（私有，测试专用：destroy/blackhole/latency/throttle/idle/flappy/reject）
 └── dsh-remote-access/   # dsh-remote-access — DSH 插件：设置页手动启用隧道接入网关（二维码深链）
 docs/superpowers/specs/   # 隧道帧协议与设计文档（改协议/行为前先读）
 ```

@@ -3,6 +3,10 @@
  * 状态：off → connecting → connected / error；disconnected 后回到
  * connecting（Connection 内建断线重连 + tunnelId 回带复用）。
  * enable 幂等：先关闭旧实例再新建（配置变更后重新启用）。
+ * 错误分级（线上 1006 非法 close 帧误报修复）：ws 级瞬时 'error'（中间件
+ * synthesized 非法帧、网络抖动）只诊断不落状态——内建重连随后经
+ * disconnected → connecting → connected 自动收敛；仅终态 'fatal'
+ * （4409 / 重连耗尽）与 enable 首连失败才落 error 态。
  */
 
 import os from 'node:os';
@@ -10,6 +14,7 @@ import os from 'node:os';
 import { Client } from 'gateway-client';
 
 import { buildSelectDeepLink, deriveGatewayEndpoints, type GatewayEndpoints } from './gateway-url';
+import { createPluginLogger } from './logger';
 
 import type { RemoteAccessConfig } from './config';
 import type { ConnectionStatusDto } from '../shared/types';
@@ -54,12 +59,9 @@ export class ConnectionManager {
         hostname,
         token: cfg.token,
         compress: cfg.compress,
-        logger: {
-          debug: () => undefined,
-          info: (m) => console.info(`${LOG_PREFIX} [INFO] ${m}`),
-          warn: (m) => console.warn(`${LOG_PREFIX} [WARN] ${m}`),
-          error: (m) => console.error(`${LOG_PREFIX} [ERROR] ${m}`),
-        },
+        // 隧道连接数原样透传：undefined 时 Client 默认 4（spec §8）
+        connections: cfg.connections,
+        logger: createPluginLogger(),
       });
       this.client = client;
       this.endpoints = endpoints;
@@ -70,8 +72,12 @@ export class ConnectionManager {
     }
     console.info(`${LOG_PREFIX} [INFO] 开始连接网关: ${endpoints.gatewayUrl}（hostname=${hostname}）`);
 
-    // EventEmitter 语义：error 事件必须挂监听
-    client.on('error', (err: Error) => {
+    // EventEmitter 语义：error 事件必须挂监听。
+    // 瞬时 ws 错误（非法帧/抖动）不落状态——Connection 内建重连随后经
+    // disconnected → connecting → connected 收敛；gateway-client 日志已记诊断。
+    client.on('error', () => undefined);
+    // 终态失败（已就绪后 4409 / 重连次数耗尽，不再重连）才落 error 态
+    client.on('fatal', (err: Error) => {
       if (this.client === client) this.info = { state: 'error', error: err.message };
     });
     client.on('connected', () => {
@@ -87,8 +93,10 @@ export class ConnectionManager {
       console.info(`${LOG_PREFIX} [INFO] 隧道已连接: tunnelId=${tunnelId ?? '-'}`);
     });
     client.on('disconnected', () => {
-      // 断线重连由 Connection 内建；曾连上后的断开回到 connecting
-      if (this.client === client && this.info.state === 'connected') this.info = { state: 'connecting' };
+      // 断线重连由 Connection 内建：只要未 disable 一律回 connecting（重连退避中）。
+      // 终态断开（4409/重连耗尽）在同一 close 处理后由随后的 'fatal' 落 error，
+      // 此处先置 connecting 无害；瞬时错误抢先把状态打成 error 的场景也由此归位
+      if (this.client === client && this.info.state !== 'off') this.info = { state: 'connecting' };
     });
 
     try {

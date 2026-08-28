@@ -130,3 +130,32 @@ describe('headers 工具', () => {
     expect(out).toEqual({ 'set-cookie': ['a=1'] });
   });
 });
+
+describe('多连接协议扩展', () => {
+  it('hello 携带 multiConn/attach 字段编解码往返', () => {
+    const frame = {
+      type: 'hello' as const,
+      client: { hostname: 'pc-a', defaultPath: '/', multiConn: { count: 4 }, attach: true, tunnelId: 'tid-1' },
+    };
+    const decoded = decodeControl(encodeControl(frame));
+    expect(decoded).toEqual(frame);
+  });
+
+  it('hello.ack 携带 multiConn.max 编解码往返', () => {
+    const frame = { type: 'hello.ack' as const, tunnelId: 'tid-1', multiConn: { max: 16 } };
+    expect(decodeControl(encodeControl(frame))).toEqual(frame);
+  });
+
+  it('通道级控制帧与数据帧头携带 seq 往返', () => {
+    const head = { type: 'http.head' as const, channelId: 7, seq: 3, status: 200, headers: {} };
+    expect(decodeControl(encodeControl(head))).toEqual(head);
+    const { header, payload } = decodeData(encodeData({ channelId: 7, kind: 'http.body', seq: 4 }, Buffer.from('x')));
+    expect(header).toEqual({ channelId: 7, kind: 'http.body', seq: 4 });
+    expect(payload.toString()).toBe('x');
+  });
+
+  it('无 seq 的旧帧形态保持不变（legacy 兼容）', () => {
+    const decoded = decodeControl(encodeControl({ type: 'http.head', channelId: 1, status: 200, headers: {} }));
+    expect('seq' in decoded).toBe(false);
+  });
+});

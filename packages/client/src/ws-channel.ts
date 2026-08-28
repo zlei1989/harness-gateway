@@ -13,14 +13,14 @@ import {
   normalizeHeaders, stripHopByHop, type WsOpenFrame,
 } from './protocol';
 
-import type { Connection } from './connection';
+import type { TunnelSender } from './connection';
 import type { Logger } from './logger';
 
 export interface WsChannelParams {
   id: number;
   open: WsOpenFrame;
   upstream: URL;
-  connection: Connection;
+  connection: TunnelSender;
   authorize: (req: AuthRequest) => Promise<AuthDecision>;
   logger: Logger;
   onDone: (id: number) => void;

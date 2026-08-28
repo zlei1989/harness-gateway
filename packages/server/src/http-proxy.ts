@@ -19,6 +19,8 @@ export interface ProxyContext {
   sessions: BrowserSessionStore;
   selectPath: string;
   headTimeoutMs: number;
+  /** 瞬断宽限（毫秒）：隧道离线时新请求挂起等重连，耗尽才 502；0 = 即时 502 旧行为 */
+  tunnelRestoreGraceMs: number;
   logger: Logger;
   /** CORS 允许名单判定（见 cors.ts）；名单外 Origin 不附 CORS 头，浏览器自行拦截 */
   corsAllowOrigin: (origin: string) => boolean;
@@ -93,11 +95,11 @@ function withCors(headers: HeadersJson, cors: Record<string, string> | null): He
 }
 
 /** 浏览器 HTTP 请求入口（非保留路径） */
-export function handleBrowserHttp(
+export async function handleBrowserHttp(
   req: IncomingMessage,
   res: ServerResponse,
   ctx: ProxyContext,
-): void {
+): Promise<void> {
   if (handlePreflight(req, res, ctx)) return;
   const cors = corsHeaders(req, ctx.corsAllowOrigin);
   // cookie 会话检查：无/失效 → 302 选择页
@@ -108,8 +110,20 @@ export function handleBrowserHttp(
     res.end();
     return;
   }
-  const tunnel = ctx.tunnels.get(session.tunnelId);
+  let tunnel = ctx.tunnels.get(session.tunnelId);
+  if (!tunnel && ctx.tunnelRestoreGraceMs > 0) {
+    // 瞬断宽限（spec §8）：新请求挂起等重连（在途通道仍立即失败，语义不变）；
+    // 等待期间浏览器断开则放弃等待（browserGone 竞速胜出 → 下方 writableEnded/destroyed 判走）
+    ctx.logger.info('隧道离线，宽限等待重连', { hostname: session.hostname, graceMs: ctx.tunnelRestoreGraceMs });
+    const browserGone = new Promise<null>((resolve) => res.once('close', () => resolve(null)));
+    tunnel = (await Promise.race([
+      ctx.tunnels.waitFor(session.tunnelId, ctx.tunnelRestoreGraceMs),
+      browserGone,
+    ])) ?? undefined;
+    if (tunnel) ctx.logger.info('隧道已恢复，继续转发', { hostname: session.hostname });
+  }
   if (!tunnel) {
+    if (res.writableEnded || res.destroyed) return; // 宽限期间浏览器已走
     ctx.logger.warn('隧道离线', { hostname: session.hostname });
     res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', ...cors });
     res.end('tunnel offline');

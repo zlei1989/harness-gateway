@@ -7,6 +7,7 @@
 - 修订：2026-08-21 第三轮（设计评审修订）——`channel.close` 改双向；4409 定为进程级错误不重连；空体强制 `http.body.end` 收尾；headers 编码 `string | string[]`；`X-Forwarded-For` 注入与 `req.ip` 语义；`connect()` 首连重试 + `connectTimeoutMs`；`close()` 先关隧道再中止在途；token 流经隧道的安全提示；子协议回选校验。
 - 修订：2026-08-24——隧道身份改为服务端分配的 **tunnelId（uuid）**：`hello.ack` 携带 tunnelId，客户端进程内存记住并在重连时经 `hello` 回带，服务端空闲即复用（浏览器会话随之恢复）；hostname 降为纯展示名、**同名并存**，4409 同名仲裁移除（客户端 4409 处理保留作旧版服务端兼容，变为不可达分支）；CLI 就绪日志打印 tunnelId 供拼 `select?tunnelId=` 深链。
 - 修订：2026-08-28 第二轮——**压缩传输**：`ClientOptions.compress`（默认关）为 upstream 未压缩的可压缩响应代做 br/gzip 端到端压缩，一次压缩覆盖 client→server→browser 两段链路（§5.1）。
+- 修订：2026-08-28——多连接（帧级条带化 + 每通道重排序）：hello multiConn/attach、hello.ack max、通道帧 seq、4410，详见《2026-08-28-gateway-multiconn-design.md》。
 
 ## 1. 背景与目标
 

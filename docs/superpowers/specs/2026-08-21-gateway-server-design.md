@@ -5,6 +5,7 @@
 - 范围：仅服务端包。客户端设计见《2026-08-21-gateway-client-design.md》；隧道帧协议由两份文档共同定义，字段以客户端文档 §4 加本文档 §5 的 hello 扩展为准。
 - 修订：2026-08-21（设计评审修订）——协议保真改为「HTTP/WS 语义保真」消除与客户端 `upstreamUrl` 的歧义；headers 三处加工增加 `X-Forwarded-For` 注入并约定 `string | string[]` 编码；无 body 请求强制空载 `http.body.end` 收尾；`ws.accept` 子协议回选校验；4409 客户端不重连；token 流经隧道的安全提示。
 - 修订：2026-08-24——隧道身份改为服务端分配的 **tunnelId（uuid）**：`hello.ack` 携带 tunnelId、`hello` 支持回带上次 tunnelId 复用（保浏览器会话）；hostname 降为纯展示名、**同名并存**（4409 同名仲裁移除）；选择页改为图标矩阵 + 点击弹框输 token + ajax 异步登录（POST 全 JSON 响应），支持 `?tunnelId=` 深链自动弹框；浏览器会话改挂 tunnelId。
+- 修订：2026-08-28——多连接（帧级条带化 + 每通道重排序）：hello multiConn/attach、hello.ack max、通道帧 seq、4410，详见《2026-08-28-gateway-multiconn-design.md》。
 
 ## 1. 背景与目标
 

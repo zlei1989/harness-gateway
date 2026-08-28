@@ -7,6 +7,10 @@
  * token 只用于协议帧与断言，任何断言消息/日志不得打印 token。
  */
 
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 
@@ -26,6 +30,8 @@ const base = (): string => `http://127.0.0.1:${port}`;
 beforeEach(async () => {
   server = new GatewayServer({
     port: 0, headTimeoutMs: 500, helloTimeoutMs: 500, logger: nullLogger,
+    // 瞬断宽限关断：本文件锁定的是"隧道离线即时 502"旧语义（宽限行为由 e2e-chaos S18/S19 覆盖）
+    tunnelRestoreGraceMs: 0,
   });
   port = await server.listen();
 });
@@ -233,5 +239,87 @@ describe('e2e：优雅关停', () => {
     const code = await withTimeout(browserClosed, 2000);
     expect(code).not.toBe('hang');
     server = null; // 已关闭，afterEach 跳过
+  });
+});
+
+describe('e2e：会话持久化（E 组）', () => {
+  let dir = '';
+  let srv: GatewayServer | null = null;
+  let srvPort = 0;
+  const persistPath = (): string => join(dir, 'sessions.json');
+  const srvBase = (): string => `http://127.0.0.1:${srvPort}`;
+  const srvTunnelUrl = (): string => `ws://127.0.0.1:${srvPort}/__gateway__/tunnel`;
+
+  afterEach(async () => {
+    await srv?.close();
+    srv = null;
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = '';
+  });
+
+  async function startServer(opts: { ttlMs?: number } = {}): Promise<void> {
+    srv = new GatewayServer({
+      port: 0, headTimeoutMs: 500, helloTimeoutMs: 500, logger: nullLogger,
+      sessionStorePath: persistPath(),
+      ...(opts.ttlMs !== undefined ? { browserSessionTtlMs: opts.ttlMs } : {}),
+    });
+    srvPort = await srv.listen();
+  }
+
+  async function selectCookie(tunnelId: string): Promise<string> {
+    const res = await fetch(`${srvBase()}/__gateway__/select`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: `tunnelId=${tunnelId}&token=good-token`,
+      redirect: 'manual',
+    });
+    expect(res.status).toBe(200);
+    return res.headers.get('set-cookie') ?? '';
+  }
+
+  it('S15：服务端重启 → 快照恢复 + tunnelId 回带复用 → 老 cookie 免重登', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'gw-e2e-persist-'));
+    await startServer();
+    const a = new MockTunnelClient({ gatewayUrl: srvTunnelUrl(), hostname: 'pc-a', validToken: 'good-token' });
+    clients.push(a);
+    await a.connect();
+    const cookie = await selectCookie(a.tunnelId ?? '');
+    await srv?.close(); // 优雅关停：快照已在 create 时同步落盘
+
+    await startServer(); // 同 persistPath 重启
+    const b = new MockTunnelClient({ gatewayUrl: srvTunnelUrl(), hostname: 'pc-a', validToken: 'good-token' });
+    clients.push(b);
+    b.tunnelId = a.tunnelId; // 进程内存回带（等价真实 Client 重连行为）
+    await b.connect();
+    expect(b.tunnelId).toBe(a.tunnelId); // 注册表为空，复用必成功
+
+    const res = await fetch(`${srvBase()}/api/x`, { headers: { cookie } });
+    expect(res.status).toBe(200); // 免重登：会话恢复 + 隧道重新对上
+  });
+
+  it('S16：浏览器重开（仅带持久 cookie 的新 HTTP 会话）→ 免重登', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'gw-e2e-persist-'));
+    await startServer();
+    const a = new MockTunnelClient({ gatewayUrl: srvTunnelUrl(), hostname: 'pc-a', validToken: 'good-token' });
+    clients.push(a);
+    await a.connect();
+    const cookie = await selectCookie(a.tunnelId ?? '');
+    expect(cookie).toContain('Max-Age='); // 持久化的载体
+    const res = await fetch(`${srvBase()}/api/x`, { headers: { cookie: cookie.split(';')[0] ?? '' } });
+    expect(res.status).toBe(200); // 新"浏览器"只带 gateway_sid kv
+  });
+
+  it('S17：会话 TTL 过期 → 302 重选且快照同步清理', async () => {
+    dir = mkdtempSync(join(tmpdir(), 'gw-e2e-persist-'));
+    await startServer({ ttlMs: 400 });
+    const a = new MockTunnelClient({ gatewayUrl: srvTunnelUrl(), hostname: 'pc-a', validToken: 'good-token' });
+    clients.push(a);
+    await a.connect();
+    const cookie = await selectCookie(a.tunnelId ?? '');
+    await new Promise((r) => setTimeout(r, 500)); // 真实时钟过期（waitFor 无法加速 TTL 本身，400ms 可控）
+    const res = await fetch(`${srvBase()}/api/x`, { headers: { cookie }, redirect: 'manual' });
+    expect(res.status).toBe(302);
+    const raw = JSON.parse(readFileSync(persistPath(), 'utf8')) as { sessions: unknown[] };
+    expect(raw.sessions).toHaveLength(0); // get 惰性过期已触发落盘清扫
   });
 });

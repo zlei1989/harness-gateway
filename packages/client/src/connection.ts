@@ -9,6 +9,11 @@
  * 本地 bufferedAmount 只是本机队列），超窗暂停生产。ack 同时为下载方向提供规律入站活性，
  * 心跳"静默判死"因此不会被限流拥塞蒙蔽（线上断连根因修复）。
  * 注意：hello.ack/ping/pong/tunnel.ack 在本层消化，不上抛；'error' 事件必须被外层监听（EventEmitter 语义）。
+ * 错误语义分级（线上 1006 非法 close 帧误报修复）：
+ * - 'error' = 诊断性事件：ws 级瞬时错误（中间件 synthesized 非法帧、网络抖动等），
+ *   随后由 'close' 驱动内建重连自动收敛，外层不得据此判终态；
+ * - 'fatal' = 终态失败：不再重连（已就绪后 4409 / 重连次数耗尽），外层应落 error 态；
+ *   首连期的终态失败走 connect() reject（connectTimeoutMs / 4409），不发 'fatal'。
  */
 
 import { EventEmitter } from 'node:events';
@@ -16,7 +21,7 @@ import { EventEmitter } from 'node:events';
 import WebSocket from 'ws';
 
 import {
-  type ControlFrame, type DataHeader, decodeControl, decodeData,
+  ATTACH_REJECT_CODE, type ControlFrame, type DataHeader, decodeControl, decodeData,
   encodeControl, encodeData, MAX_PAYLOAD_BYTES,
 } from './protocol';
 
@@ -30,11 +35,28 @@ export interface ReconnectOptions {
 
 export interface ConnectionOptions {
   gatewayUrl: string;
-  hello: { hostname: string; defaultPath: string };
+  hello: {
+    hostname: string;
+    defaultPath: string;
+    /** 多连接协商：期望的总连接数（含本连接，≥2 才声明）；缺省 = 单连接（老行为） */
+    multiConn?: { count: number };
+    /** attach 握手：请求加入 initialTunnelId 指定的既有隧道组而非新建隧道 */
+    attach?: boolean;
+    /** attach leg 用：构造即植入的 tunnelId（primary 当前值），优先于进程记忆 */
+    initialTunnelId?: string;
+  };
   heartbeatIntervalMs: number;
   connectTimeoutMs: number;
   reconnect: ReconnectOptions;
   logger: Logger;
+}
+
+/** 隧道发送面（TunnelGroup 条带化的 leg 抽象）：Connection 天然实现 */
+export interface TunnelSender {
+  sendControl(frame: ControlFrame): void;
+  /** 返回 false = 应暂停生产并 waitDrain() 后恢复 */
+  sendData(header: DataHeader, payload: Buffer): boolean;
+  waitDrain(): Promise<void>;
 }
 
 /** 上行帧回调（hello.ack/ping/pong 已消化，不会出现在这里） */
@@ -72,7 +94,7 @@ function toBuffer(data: WebSocket.RawData): Buffer {
   return Buffer.from(data);
 }
 
-export class Connection extends EventEmitter {
+export class Connection extends EventEmitter implements TunnelSender {
   private ws: WebSocket | null = null;
   private readyState = false;
   private closing = false;
@@ -103,12 +125,16 @@ export class Connection extends EventEmitter {
   private drainTimer: NodeJS.Timeout | null = null;
   private connectResolve: (() => void) | null = null;
   private connectReject: ((err: Error) => void) | null = null;
+  /** hello.ack 协商出的服务端多连接上限；undefined = 老服务端不支持 */
+  private serverMaxLegsValue: number | undefined;
 
   constructor(
     private readonly opts: ConnectionOptions,
     private readonly handlers: ConnectionHandlers,
   ) {
     super();
+    // attach leg 的种子 tunnelId：优先于进程记忆，首连 hello 即回带
+    this.lastTunnelId = opts.hello.initialTunnelId;
   }
 
   /** 隧道是否就绪（已收到 hello.ack） */
@@ -119,6 +145,25 @@ export class Connection extends EventEmitter {
   /** 服务端分配的 tunnelId（未就绪过为 undefined） */
   get tunnelId(): string | undefined {
     return this.lastTunnelId;
+  }
+
+  /** hello.ack 协商出的服务端多连接上限；undefined = 老服务端不支持 */
+  get serverMaxLegs(): number | undefined {
+    return this.serverMaxLegsValue;
+  }
+
+  /** 可用容量分（加权条带化选 leg 依据）：min(端到端窗口剩余, 本地水位剩余)；未就绪/全满 ≤ 0 */
+  availableCapacity(): number {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.readyState) return 0;
+    const local = HIGH_WATER_BYTES - this.ws.bufferedAmount;
+    if (!this.flowAckActive) return Math.max(0, local);
+    const windowLeft = this.currentFlowWindow() - (this.dataBytesSent - this.dataBytesAcked);
+    return Math.max(0, Math.min(local, windowLeft));
+  }
+
+  /** 整组重连触发点（TunnelGroup 用）：terminate 当前 ws 走既有 close→退避重连路径（closing 保持 false） */
+  forceReconnect(): void {
+    this.ws?.terminate();
   }
 
   /** 建立隧道：首连失败持续退避重试；connectTimeoutMs 未就绪 / 4409 → reject */
@@ -239,10 +284,11 @@ export class Connection extends EventEmitter {
       // 重连回带上次 tunnelId 请求复用（服务端空闲即保留浏览器会话，首连无此字段）；
       // flowControl 声明支持 tunnel.ack 端到端流量窗口（老服务端忽略该字段、不回 ack = 不支持）
       const client = {
-        ...this.opts.hello,
+        ...this.opts.hello, // hostname/defaultPath/multiConn/attach 一并下传
         flowControl: true,
         ...(this.lastTunnelId ? { tunnelId: this.lastTunnelId } : {}),
       };
+      delete (client as { initialTunnelId?: string }).initialTunnelId; // 内部字段，不上线
       ws.send(encodeControl({ type: 'hello', client }));
     });
 
@@ -337,6 +383,7 @@ export class Connection extends EventEmitter {
       if (typeof frame.tunnelId === 'string' && frame.tunnelId.length > 0) {
         this.lastTunnelId = frame.tunnelId;
       }
+      this.serverMaxLegsValue = frame.multiConn?.max;
       this.readyState = true;
       this.readyAt = Date.now();
       this.attempts = 0; // 重连成功后重置退避
@@ -376,7 +423,7 @@ export class Connection extends EventEmitter {
     this.callChannelHandler(() => this.handlers.onControl(frame));
   }
 
-  /** 关闭处理：4409 进程级不重连；其余按退避重连（closing 时不重连） */
+  /** 关闭处理：4409/4410 终态不重连；其余按退避重连（closing 时不重连） */
   private handleClose(code: number, reason: Buffer): void {
     const wasReady = this.readyState;
     this.readyState = false;
@@ -396,11 +443,17 @@ export class Connection extends EventEmitter {
       this.emit('disconnected');
     }
     if (this.closing) return;
-    if (code === 4409) {
-      const err = new Error('hostname conflict (4409): 同名客户端已在线');
-      this.opts.logger.error('hostname 冲突，不再重连', { hostname: this.opts.hello.hostname });
+    // 4409 = hostname 冲突（老服务端）；4410 = attach 拒绝（目标隧道不存在/已满/非多连接会话）；均为终态不重连
+    if (code === 4409 || code === ATTACH_REJECT_CODE) {
+      const err = new Error(code === 4409
+        ? 'hostname conflict (4409): 同名客户端已在线'
+        : 'attach rejected (4410): 目标隧道不存在/已满/非多连接会话');
+      this.opts.logger.error(code === 4409 ? 'hostname 冲突，不再重连' : 'attach 被拒绝，不再重连', { hostname: this.opts.hello.hostname });
       if (this.connectReject) this.connectReject(err);
-      else this.emit('error', err);
+      else {
+        this.emit('error', err);
+        this.emit('fatal', err); // 已就绪会话的终态失败：不重连，外层落 error 态
+      }
       return;
     }
     this.scheduleReconnect();
@@ -416,6 +469,7 @@ export class Connection extends EventEmitter {
       } else {
         this.opts.logger.warn('重连次数耗尽，停止重试', { attempts: this.attempts });
         this.emit('error', err);
+        this.emit('fatal', err); // 已就绪会话的终态失败：不再重试，外层落 error 态
       }
       return;
     }
@@ -424,7 +478,12 @@ export class Connection extends EventEmitter {
     const delay = exp * (0.5 + Math.random() * 0.5);
     this.attempts += 1;
     this.opts.logger.info('隧道重连中', { attempts: this.attempts, delayMs: Math.round(delay) });
-    this.reconnectTimer = setTimeout(() => this.attempt(), delay);
+    this.reconnectTimer = setTimeout(() => {
+      // 触发即清引用：字段语义为"待触发的重连定时器"（与 TunnelGroup.attachTimers 回调内 delete 同构）；
+      // fired 后残留引用会让稳态不变量（无残留重连定时器）失真——S12 重连风暴场景暴露
+      this.reconnectTimer = null;
+      this.attempt();
+    }, delay);
   }
 
   /**

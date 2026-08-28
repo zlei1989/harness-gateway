@@ -20,6 +20,8 @@ export interface RemoteAccessConfig {
   gateway: string;
   /** 压缩传输：为 upstream 未压缩的可压缩响应代做 br/gzip 端到端压缩 */
   compress: boolean;
+  /** 隧道连接数（可选；默认 4，1=单连接 legacy 模式，详见网关 README） */
+  connections?: number;
 }
 
 export const DEFAULT_GATEWAY = 'harness-gateway.7qbjs.com';
@@ -51,6 +53,8 @@ export function loadConfig(homeDir: string): RemoteAccessConfig {
     token: typeof raw.token === 'string' && /^[0-9a-zA-Z]+$/.test(raw.token) ? raw.token : randomToken(8),
     gateway: typeof raw.gateway === 'string' && raw.gateway.trim() ? raw.gateway : DEFAULT_GATEWAY,
     compress: typeof raw.compress === 'boolean' ? raw.compress : true,
+    // 可选字段：仅在 yaml 手工配置时透传（不落盘补全，缺省由 gateway-client 默认 4 接管）
+    connections: typeof raw.connections === 'number' ? raw.connections : undefined,
   };
   // 补全了缺省字段则落盘（token 等默认值生成一次后稳定）
   if (cfg.hostname !== raw.hostname || cfg.token !== raw.token || cfg.gateway !== raw.gateway

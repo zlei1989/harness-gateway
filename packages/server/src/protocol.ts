@@ -8,23 +8,44 @@ export type HeadersJson = Record<string, string | string[]>;
 
 // ---- 控制帧 ----
 
-export interface HelloFrame { type: 'hello'; client: { hostname: string; defaultPath: string; tunnelId?: string; flowControl?: boolean } }
-export interface HelloAckFrame { type: 'hello.ack'; tunnelId: string }
+export interface HelloFrame {
+  type: 'hello';
+  client: {
+    hostname: string;
+    defaultPath: string;
+    tunnelId?: string;
+    flowControl?: boolean;
+    /** 多连接协商：期望的总连接数（含本连接，≥2 才声明）；缺省 = 单连接（老行为） */
+    multiConn?: { count: number };
+    /** attach 握手：请求加入 tunnelId 指定的既有隧道组而非新建隧道（仅协商成功后发送） */
+    attach?: boolean;
+  };
+}
+export interface HelloAckFrame {
+  type: 'hello.ack';
+  tunnelId: string;
+  /** 服务端支持多连接 + 本隧道允许的最大连接数；缺省 = 不支持（老服务端） */
+  multiConn?: { max: number };
+}
+
+/** attach 拒绝关闭码：目标 tunnelId 不存在/组已满/会话非多连接模式（spec §3.2） */
+export const ATTACH_REJECT_CODE = 4410;
 /**
  * 隧道级流量确认（端到端背压 + 存活心跳载体）：服务端按收到数据帧的累计字节数定期回执，
  * 客户端据此把在途数据钳制在窗口内（内核/中间盒缓冲对应用不可见，本地 bufferedAmount 无法度量端到端在途量），
  * 且下载方向（客户端→服务端数据、服务端→客户端静默）为客户端提供规律的入站活性，心跳判死不再被拥塞蒙蔽
  */
 export interface TunnelAckFrame { type: 'tunnel.ack'; bytes: number }
-export interface HttpOpenFrame { type: 'http.open'; channelId: number; method: string; url: string; headers: HeadersJson }
-export interface WsOpenFrame { type: 'ws.open'; channelId: number; url: string; headers: HeadersJson; protocols: string[] }
+// 通道级控制帧统一约定：seq 为多连接条带化的通道内序号（每 (channelId, 方向) 从 0 单调递增），仅协商成功的隧道组携带；缺省保持旧帧形态
+export interface HttpOpenFrame { type: 'http.open'; channelId: number; seq?: number; method: string; url: string; headers: HeadersJson }
+export interface WsOpenFrame { type: 'ws.open'; channelId: number; seq?: number; url: string; headers: HeadersJson; protocols: string[] }
 /** 双向：网关→客户端 = 浏览器侧关闭/取消；客户端→网关 = upstream 主动关闭/中止 */
-export interface ChannelCloseFrame { type: 'channel.close'; channelId: number; code?: number; reason?: string }
-export interface HttpHeadFrame { type: 'http.head'; channelId: number; status: number; headers: HeadersJson }
-export interface WsAcceptFrame { type: 'ws.accept'; channelId: number; protocol?: string }
+export interface ChannelCloseFrame { type: 'channel.close'; channelId: number; seq?: number; code?: number; reason?: string }
+export interface HttpHeadFrame { type: 'http.head'; channelId: number; seq?: number; status: number; headers: HeadersJson }
+export interface WsAcceptFrame { type: 'ws.accept'; channelId: number; seq?: number; protocol?: string }
 /** body 仅支持文本（控制帧为 JSON，无二进制体） */
-export interface WsRejectFrame { type: 'ws.reject'; channelId: number; status: number; headers?: HeadersJson; body?: string }
-export interface ChannelErrorFrame { type: 'channel.error'; channelId: number; message: string }
+export interface WsRejectFrame { type: 'ws.reject'; channelId: number; seq?: number; status: number; headers?: HeadersJson; body?: string }
+export interface ChannelErrorFrame { type: 'channel.error'; channelId: number; seq?: number; message: string }
 export interface PingFrame { type: 'ping' }
 export interface PongFrame { type: 'pong' }
 
@@ -52,7 +73,7 @@ export function encodeControl(frame: ControlFrame): string {
   return JSON.stringify(frame);
 }
 
-/** 解码控制帧；非对象、未知 type 抛 ProtocolError */
+/** 解码控制帧；非对象、未知 type 抛 ProtocolError；不做严格字段校验，可选字段（multiConn/attach/seq 等）随 JSON 自然透传 */
 export function decodeControl(text: string): ControlFrame {
   let parsed: unknown;
   try {
@@ -79,6 +100,8 @@ export interface DataHeader {
   kind: DataKind;
   /** 仅 kind === 'ws.message' 使用，保持 WS 消息类型保真 */
   dataType?: 'text' | 'binary';
+  /** 多连接条带化的通道内序号（每 (channelId, 方向) 从 0 单调递增）；仅协商成功的隧道组携带 */
+  seq?: number;
 }
 
 const DATA_KINDS = new Set<string>(['http.body', 'http.body.end', 'ws.message']);
@@ -116,7 +139,7 @@ export function encodeData(header: DataHeader, payload: Buffer): Buffer {
   return out;
 }
 
-/** 解码数据帧；长度越界/头非法抛 ProtocolError */
+/** 解码数据帧；长度越界/头非法抛 ProtocolError；可选字段（seq 等）不做严格校验，随 JSON 自然透传 */
 export function decodeData(buf: Buffer): { header: DataHeader; payload: Buffer } {
   if (buf.length < 4) throw new ProtocolError('数据帧过短');
   const headLen = buf.readUInt32BE(0);

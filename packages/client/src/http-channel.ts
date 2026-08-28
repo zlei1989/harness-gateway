@@ -13,7 +13,7 @@ import zlib from 'node:zlib';
 import { type AuthDecision, type AuthRequest, buildAuthRequest } from './authorize';
 import { type ChannelCloseFrame, type HeadersJson, type HttpOpenFrame, normalizeHeaders, stripHopByHop } from './protocol';
 
-import type { Connection } from './connection';
+import type { TunnelSender } from './connection';
 import type { Logger } from './logger';
 
 /**
@@ -58,7 +58,8 @@ export interface HttpChannelParams {
   id: number;
   open: HttpOpenFrame;
   upstream: URL;
-  connection: Connection;
+  /** 隧道发送面（多连接 TunnelGroup 条带化的 leg 抽象；只用 sendControl/sendData/waitDrain） */
+  connection: TunnelSender;
   authorize: (req: AuthRequest) => Promise<AuthDecision>;
   logger: Logger;
   /**

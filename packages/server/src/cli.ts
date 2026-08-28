@@ -20,11 +20,14 @@ export interface CliArgs {
   tunnelPerMessageDeflate?: boolean;
   /** 浏览器侧 HTTP keep-alive 空闲超时（毫秒） */
   keepAliveTimeoutMs?: number;
+  sessionStorePath?: string | undefined;
+  browserSessionTtlMs?: number | undefined;
   help: boolean;
 }
 
 const USAGE = '用法: harness-server [--port <9000>] [--tunnel-path <path>] [--select-path <path>] '
-  + '[--tunnel-permessage-deflate] [--keep-alive-timeout-ms <ms>]\n'
+  + '[--tunnel-permessage-deflate] [--keep-alive-timeout-ms <ms>] '
+  + '[--session-store <path>] [--browser-session-ttl <ms>]\n'
   + '环境变量: HARNESS_CORS_ORIGINS —— 逗号分隔的 CORS 允许名单（默认 *.7qbjs.com,*.jd.com,localhost,127.0.0.1；* 全放行）';
 
 /** 单行诊断：只取 message 首行，剥离堆栈与代码帧 */
@@ -39,6 +42,8 @@ export function parseArgs(argv: string[]): CliArgs {
   let selectPath: string | undefined;
   let tunnelPerMessageDeflate = false;
   let keepAliveTimeoutMs: number | undefined;
+  let sessionStorePath: string | undefined;
+  let browserSessionTtlMs: number | undefined;
   let help = false;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -65,11 +70,21 @@ export function parseArgs(argv: string[]): CliArgs {
         throw new Error(`--keep-alive-timeout-ms 非法: ${value}（须正整数毫秒值）`);
       }
       keepAliveTimeoutMs = parsed;
+    } else if (arg === '--session-store') {
+      sessionStorePath = argv[++i];
+      if (!sessionStorePath) throw new Error('--session-store 缺参数值');
+    } else if (arg === '--browser-session-ttl') {
+      const value = argv[++i];
+      const parsed = Number(value);
+      if (!value || !Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error(`--browser-session-ttl 非法: ${value}（须正整数毫秒值）`);
+      }
+      browserSessionTtlMs = parsed;
     } else {
       throw new Error(`未知参数: ${arg}`);
     }
   }
-  return { port, tunnelPath, selectPath, tunnelPerMessageDeflate, keepAliveTimeoutMs, help };
+  return { port, tunnelPath, selectPath, tunnelPerMessageDeflate, keepAliveTimeoutMs, sessionStorePath, browserSessionTtlMs, help };
 }
 
 /** 主流程：返回退出码（0 正常；1 失败） */
@@ -94,6 +109,8 @@ export async function main(argv: string[]): Promise<number> {
       selectPath: args.selectPath,
       tunnelPerMessageDeflate: args.tunnelPerMessageDeflate,
       keepAliveTimeoutMs: args.keepAliveTimeoutMs,
+      sessionStorePath: args.sessionStorePath,
+      browserSessionTtlMs: args.browserSessionTtlMs,
       corsOrigins: parseCorsOrigins(process.env['HARNESS_CORS_ORIGINS']),
     });
   } catch (err) {

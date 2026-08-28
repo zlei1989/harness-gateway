@@ -8,7 +8,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 import { WebSocketServer } from 'ws';
 
-import { BrowserSessionStore } from './browser-session';
+import { BrowserSessionStore, DEFAULT_SESSION_TTL_MS } from './browser-session';
 import { createOriginMatcher, DEFAULT_CORS_ORIGINS } from './cors';
 import { handleBrowserHttp, type ProxyContext } from './http-proxy';
 import { createDefaultLogger, type Logger } from './logger';
@@ -41,6 +41,15 @@ export interface GatewayServerOptions {
   keepAliveTimeoutMs?: number;
   /** CORS 允许名单（'*' 全放行，'*.jd.com' 匹配本体及子域）；默认 DEFAULT_CORS_ORIGINS */
   corsOrigins?: string[];
+  /** 浏览器会话生存期（毫秒，须为正整数；cookie Max-Age 同源）。默认 7 天 */
+  browserSessionTtlMs?: number;
+  /** 浏览器会话快照路径（缺省 = 纯内存）；明文 JSON + 0600，重启恢复 */
+  sessionStorePath?: string;
+  /**
+   * 瞬断宽限（毫秒，须为非负整数；默认 30_000）：隧道离线时新到的浏览器请求挂起等重连，
+   * 宽限内恢复则透明转发，耗尽才 502；0 = 即时 502 旧行为。宽限只保新请求，在途通道仍立即失败。
+   */
+  tunnelRestoreGraceMs?: number;
   logger?: Logger;
 }
 
@@ -50,10 +59,11 @@ const RESERVED_PREFIX = '/__gateway__/';
 const HEADERS_TIMEOUT_MARGIN_MS = 5_000;
 
 export class GatewayServer {
-  private readonly options: Required<Omit<GatewayServerOptions, 'logger'>>;
+  private readonly options: Required<Omit<GatewayServerOptions, 'logger' | 'sessionStorePath'>>
+    & Pick<GatewayServerOptions, 'sessionStorePath'>;
   private readonly logger: Logger;
   private readonly tunnels = new TunnelRegistry();
-  private readonly sessions = new BrowserSessionStore();
+  private readonly sessions: BrowserSessionStore;
   private httpServer: Server | null = null;
   private browserWss: WebSocketServer | null = null;
 
@@ -66,6 +76,14 @@ export class GatewayServer {
       && (!Number.isInteger(options.keepAliveTimeoutMs) || options.keepAliveTimeoutMs <= 0)) {
       throw new Error('GatewayServerOptions.keepAliveTimeoutMs 必须是正整数毫秒值');
     }
+    if (options.browserSessionTtlMs !== undefined
+      && (!Number.isInteger(options.browserSessionTtlMs) || options.browserSessionTtlMs <= 0)) {
+      throw new Error('GatewayServerOptions.browserSessionTtlMs 必须是正整数毫秒值');
+    }
+    if (options.tunnelRestoreGraceMs !== undefined
+      && (!Number.isInteger(options.tunnelRestoreGraceMs) || options.tunnelRestoreGraceMs < 0)) {
+      throw new Error('GatewayServerOptions.tunnelRestoreGraceMs 必须是非负整数毫秒值');
+    }
     this.logger = options.logger ?? createDefaultLogger();
     this.options = {
       port: options.port,
@@ -76,6 +94,9 @@ export class GatewayServer {
       tunnelPerMessageDeflate: options.tunnelPerMessageDeflate ?? false,
       keepAliveTimeoutMs: options.keepAliveTimeoutMs ?? 5_000,
       corsOrigins: options.corsOrigins ?? DEFAULT_CORS_ORIGINS,
+      browserSessionTtlMs: options.browserSessionTtlMs ?? DEFAULT_SESSION_TTL_MS,
+      sessionStorePath: options.sessionStorePath,
+      tunnelRestoreGraceMs: options.tunnelRestoreGraceMs ?? 30_000,
     };
     // 保留命名空间校验：分发逻辑只在 /__gateway__/ 前缀块内匹配 tunnelPath/selectPath，
     // 前缀外路径永远不会命中（302 会自指循环），构造即拒绝
@@ -84,17 +105,22 @@ export class GatewayServer {
         throw new Error(`GatewayServerOptions.${key} 必须以 ${RESERVED_PREFIX} 开头（当前: ${this.options[key]}）`);
       }
     }
+    this.sessions = new BrowserSessionStore(
+      { ttlMs: this.options.browserSessionTtlMs, persistPath: this.options.sessionStorePath },
+      this.logger,
+    );
   }
 
   /** 启动监听；返回实际绑定端口（port: 0 时用于测试） */
   listen(): Promise<number> {
-    const { tunnelPath, selectPath, helloTimeoutMs, headTimeoutMs, corsOrigins } = this.options;
+    const { tunnelPath, selectPath, helloTimeoutMs, headTimeoutMs, corsOrigins, tunnelRestoreGraceMs } = this.options;
     const keepAliveTimeoutMs = this.options.keepAliveTimeoutMs;
     const proxyCtx: ProxyContext = {
       tunnels: this.tunnels,
       sessions: this.sessions,
       selectPath,
       headTimeoutMs,
+      tunnelRestoreGraceMs,
       logger: this.logger,
       corsAllowOrigin: createOriginMatcher(corsOrigins),
     };
@@ -130,7 +156,12 @@ export class GatewayServer {
         res.end('not found');
         return;
       }
-      handleBrowserHttp(req, res, proxyCtx);
+      // async 化后（瞬断宽限等待）异常兜底：不得上溢为 unhandledRejection
+      void handleBrowserHttp(req, res, proxyCtx).catch((err: unknown) => {
+        this.logger.error('浏览器 HTTP 处理异常', { error: err instanceof Error ? err.stack : String(err) });
+        if (!res.headersSent) res.writeHead(500);
+        res.end();
+      });
     });
 
     // 隧道 WS 接入（只处理 tunnelPath，其余路径交还）
@@ -164,7 +195,11 @@ export class GatewayServer {
         socket.destroy(); // 保留命名空间不转发
         return;
       }
-      handleBrowserWs(req, socket, head, browserWss, proxyCtx);
+      // async 化后（瞬断宽限等待）异常兜底：不得上溢为 unhandledRejection
+      void handleBrowserWs(req, socket, head, browserWss, proxyCtx).catch((err: unknown) => {
+        this.logger.error('浏览器 WS 处理异常', { error: err instanceof Error ? err.stack : String(err) });
+        socket.destroy();
+      });
     });
 
     return new Promise((resolve, reject) => {

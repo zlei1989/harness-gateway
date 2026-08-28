@@ -11,7 +11,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { BrowserSessionStore } from './browser-session';
 import { createOriginMatcher } from './cors';
 import { handleBrowserHttp, type ProxyContext } from './http-proxy';
-import { type PendingChannel, TunnelRegistry } from './session';
+import { type PendingChannel, TunnelRegistry, type TunnelSession } from './session';
 
 import type { ControlFrame, DataHeader, HeadersJson } from './protocol';
 
@@ -101,7 +101,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 2000): Promise<void> {
   }
 }
 
-async function setup(opts: { withTunnel?: boolean; headTimeoutMs?: number; logger?: import('./logger').Logger; corsOrigins?: string[] } = {}) {
+async function setup(opts: { withTunnel?: boolean; headTimeoutMs?: number; graceMs?: number; logger?: import('./logger').Logger; corsOrigins?: string[] } = {}) {
   const tunnel = new FakeTunnel();
   const tunnels = new TunnelRegistry();
   if (opts.withTunnel !== false) {
@@ -114,14 +114,16 @@ async function setup(opts: { withTunnel?: boolean; headTimeoutMs?: number; logge
     sessions,
     selectPath: '/__gateway__/select',
     headTimeoutMs: opts.headTimeoutMs ?? 300,
+    // 瞬断宽限：缺省 0 = 即时 502 旧语义（既有用例不变）；宽限用例显式传 graceMs
+    tunnelRestoreGraceMs: opts.graceMs ?? 0,
     logger: opts.logger ?? nullLogger,
     corsAllowOrigin: createOriginMatcher(opts.corsOrigins ?? ['*.example.com']),
   };
-  server = createServer((req, res) => handleBrowserHttp(req, res, ctx));
+  server = createServer((req, res) => { void handleBrowserHttp(req, res, ctx); });
   await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r));
   const addr = server!.address();
   if (typeof addr === 'string' || !addr) throw new Error('no addr');
-  return { port: addr.port, tunnel, uuid };
+  return { port: addr.port, tunnel, uuid, tunnels };
 }
 
 describe('handleBrowserHttp', () => {
@@ -140,6 +142,24 @@ describe('handleBrowserHttp', () => {
 
   it('有效会话但隧道离线 → 502', async () => {
     const { port, uuid } = await setup({ withTunnel: false });
+    const res = await fetch(`http://127.0.0.1:${port}/api/x`, { headers: { cookie: `gateway_sid=${uuid}` } });
+    expect(res.status).toBe(502);
+  });
+
+  it('宽限内隧道恢复 → 请求挂起后正常转发（不 502）', async () => {
+    // 请求发出时注册表为空：进入宽限等待（而非即时 502）；200ms 后隧道重连上线唤醒挂起请求
+    const { port, tunnel, uuid, tunnels } = await setup({ withTunnel: false, graceMs: 1000 });
+    const pending = fetch(`http://127.0.0.1:${port}/api/x`, { headers: { cookie: `gateway_sid=${uuid}` } });
+    await new Promise((r) => setTimeout(r, 200));
+    expect(tunnel.openFrames.length).toBe(0); // 仍在宽限等待，未创建通道
+    tunnels.set('tid-1', tunnel as unknown as TunnelSession); // 隧道重连上线（走真 set 唤醒等待方）
+    const res = await pending;
+    expect(res.status).toBe(200); // 转发结果而非 502
+    expect(await res.text()).toBe('upstream-ok');
+  });
+
+  it('宽限耗尽仍离线 → 502', async () => {
+    const { port, uuid } = await setup({ withTunnel: false, graceMs: 150 });
     const res = await fetch(`http://127.0.0.1:${port}/api/x`, { headers: { cookie: `gateway_sid=${uuid}` } });
     expect(res.status).toBe(502);
   });

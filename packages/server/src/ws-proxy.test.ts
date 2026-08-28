@@ -104,13 +104,13 @@ async function setup(logger: import('./logger').Logger = nullLogger): Promise<st
   const tunnels = new TunnelRegistry();
   (tunnels as unknown as { tunnels: Map<string, unknown> }).tunnels.set('tid-1', tunnel);
   sessions = new BrowserSessionStore();
-  const ctx: ProxyContext = { tunnels, sessions, selectPath: '/__gateway__/select', headTimeoutMs: 300, logger };
+  const ctx: ProxyContext = { tunnels, sessions, selectPath: '/__gateway__/select', headTimeoutMs: 300, tunnelRestoreGraceMs: 0, logger };
   server = createServer((_req, res) => { res.writeHead(404); res.end(); });
   browserWss = new WebSocketServer({
     noServer: true,
     handleProtocols: (protocols) => [...protocols][0] ?? false,
   });
-  server.on('upgrade', (req, socket, head) => handleBrowserWs(req, socket, head, browserWss!, ctx));
+  server.on('upgrade', (req, socket, head) => { void handleBrowserWs(req, socket, head, browserWss!, ctx); });
   await new Promise<void>((r) => server!.listen(0, '127.0.0.1', r));
   const addr = server!.address();
   if (typeof addr === 'string' || !addr) throw new Error('no addr');
@@ -199,10 +199,10 @@ describe('handleBrowserWs', () => {
     (tunnels as unknown as { tunnels: Map<string, unknown> }).tunnels.set('tid-1', tunnel);
     const sessions2 = new BrowserSessionStore();
     const uuid = sessions2.create('tid-1', 'pc-a', 'tok-user');
-    const ctx: ProxyContext = { tunnels, sessions: sessions2, selectPath: '/__gateway__/select', headTimeoutMs: 300, logger: nullLogger };
+    const ctx: ProxyContext = { tunnels, sessions: sessions2, selectPath: '/__gateway__/select', headTimeoutMs: 300, tunnelRestoreGraceMs: 0, logger: nullLogger };
     const req = { headers: { cookie: `gateway_sid=${uuid}` }, socket: { remoteAddress: '127.0.0.1' } } as unknown as IncomingMessage;
     const socket = new FakeSocket();
-    handleBrowserWs(req, socket, Buffer.alloc(0), null as unknown as WebSocketServer, ctx);
+    void handleBrowserWs(req, socket, Buffer.alloc(0), null as unknown as WebSocketServer, ctx);
     expect(tunnel.openFrames.length).toBe(1); // 通道已登记、ws.open 已发
     const rst = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
     expect(() => socket.emit('error', rst)).not.toThrow(); // RED 判据：无监听时 EventEmitter 同步抛
@@ -215,10 +215,10 @@ describe('handleBrowserWs', () => {
     // 同事故的另一触发面：writeRawResponse 的 socket.end 落在已 RST 连接上，异步 ECONNRESET
     const tunnels = new TunnelRegistry();
     const sessions2 = new BrowserSessionStore();
-    const ctx: ProxyContext = { tunnels, sessions: sessions2, selectPath: '/__gateway__/select', headTimeoutMs: 300, logger: nullLogger };
+    const ctx: ProxyContext = { tunnels, sessions: sessions2, selectPath: '/__gateway__/select', headTimeoutMs: 300, tunnelRestoreGraceMs: 0, logger: nullLogger };
     const req = { headers: {}, socket: { remoteAddress: '127.0.0.1' } } as unknown as IncomingMessage;
     const socket = new FakeSocket();
-    handleBrowserWs(req, socket, Buffer.alloc(0), null as unknown as WebSocketServer, ctx);
+    void handleBrowserWs(req, socket, Buffer.alloc(0), null as unknown as WebSocketServer, ctx);
     expect(socket.finalized).toBe(true); // 401 已回写
     const rst = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
     expect(() => socket.emit('error', rst)).not.toThrow();
@@ -228,10 +228,10 @@ describe('handleBrowserWs', () => {
     // 假裸 socket 直连 401 路径：_final 仅在 end() 优雅收尾时触发，write+destroy 不触发
     const tunnels = new TunnelRegistry();
     const sessions2 = new BrowserSessionStore();
-    const ctx: ProxyContext = { tunnels, sessions: sessions2, selectPath: '/__gateway__/select', headTimeoutMs: 300, logger: nullLogger };
+    const ctx: ProxyContext = { tunnels, sessions: sessions2, selectPath: '/__gateway__/select', headTimeoutMs: 300, tunnelRestoreGraceMs: 0, logger: nullLogger };
     const req = { headers: {}, socket: { remoteAddress: '127.0.0.1' } } as unknown as IncomingMessage;
     const socket = new FakeSocket();
-    handleBrowserWs(req, socket, Buffer.alloc(0), null as unknown as WebSocketServer, ctx);
+    void handleBrowserWs(req, socket, Buffer.alloc(0), null as unknown as WebSocketServer, ctx);
     expect(socket.finalized).toBe(true); // RED 判据：write+destroy 时 _final 不会被调用
     const raw = Buffer.concat(socket.chunks).toString();
     expect(raw).toContain('HTTP/1.1 401');

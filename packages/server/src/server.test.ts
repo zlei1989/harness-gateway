@@ -55,6 +55,21 @@ describe('GatewayServer 流量分发', () => {
     expect(bad(1.5)).toThrow(/keepAliveTimeoutMs/);
   });
 
+  it('browserSessionTtlMs 非法（0/负数/非整数）构造抛错', () => {
+    for (const v of [0, -1, 1.5]) {
+      expect(() => new GatewayServer({ port: 0, browserSessionTtlMs: v, logger: nullLogger }))
+        .toThrow('GatewayServerOptions.browserSessionTtlMs 必须是正整数毫秒值');
+    }
+  });
+
+  it('tunnelRestoreGraceMs 非法（负数/非整数）构造抛错；0 合法（= 即时 502 旧行为）', () => {
+    for (const v of [-1, 1.5, Number.NaN]) {
+      expect(() => new GatewayServer({ port: 0, tunnelRestoreGraceMs: v, logger: nullLogger }))
+        .toThrow('GatewayServerOptions.tunnelRestoreGraceMs 必须是非负整数毫秒值');
+    }
+    expect(() => new GatewayServer({ port: 0, tunnelRestoreGraceMs: 0, logger: nullLogger })).not.toThrow();
+  });
+
   it('keepAliveTimeoutMs 透传 http.Server：headersTimeout 自动抬到其上（Node 要求 headers > keepAlive）', async () => {
     server = new GatewayServer({ port: 0, keepAliveTimeoutMs: 65_000, logger: nullLogger });
     await server.listen();
