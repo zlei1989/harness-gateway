@@ -249,3 +249,41 @@ describe('flappy / rejectUpgrade', () => {
     await echoed;
   });
 });
+
+describe('shared 限速（setThrottle mode）', () => {
+  /** 两连接并行各传 size 字节，返回较慢连接的总耗时 */
+  async function twoConnTransfer(mode: 'per-conn' | 'shared' | undefined, size: number): Promise<number> {
+    await startEcho();
+    proxy = createChaosProxy({ targetHost: '127.0.0.1', targetPort: echoPort });
+    const port = await proxy.listen();
+    if (mode === undefined) proxy.setThrottle(50_000);
+    else proxy.setThrottle(50_000, mode);
+    const startAt = Date.now();
+    await Promise.all([dial(port), dial(port)].map((s) => new Promise<void>((resolve) => {
+      let got = 0;
+      s.on('data', (c: Buffer) => { got += c.length; if (got >= size) resolve(); });
+      s.write(Buffer.alloc(size, 0x61)); // 未 connect 时内核缓冲，建连后发出
+    })));
+    return Date.now() - startAt;
+  }
+
+  it('shared：两连接共享 50KB/s，总量被全局预算钳制', async () => {
+    const elapsed = await twoConnTransfer('shared', 50_000);
+    // 理论 4s：4 pipe × 50KB = 200KB 共享一份 50KB/s 预算；保守下界 3s
+    expect(elapsed).toBeGreaterThanOrEqual(3000);
+    expect(elapsed).toBeLessThan(15_000); // 上限防泵实现失控
+  }, 20_000);
+
+  it('per-conn（显式）：两连接各自独享，总耗时 ≈ 单连接', async () => {
+    const elapsed = await twoConnTransfer('per-conn', 50_000);
+    // 理论 ≈1s：每 pipe 50KB @ 50KB/s，两连接四 pipe 并行各自有预算
+    expect(elapsed).toBeGreaterThanOrEqual(800);
+    expect(elapsed).toBeLessThan(2500); // 与 shared（≥3s）拉开区分度
+  }, 10_000);
+
+  it('不传 mode：缺省 per-conn（回归保护）', async () => {
+    const elapsed = await twoConnTransfer(undefined, 50_000);
+    expect(elapsed).toBeGreaterThanOrEqual(800);
+    expect(elapsed).toBeLessThan(2500);
+  }, 10_000);
+});

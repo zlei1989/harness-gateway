@@ -9,6 +9,7 @@ import { STATUS_CODES } from 'node:http';
 import net from 'node:net';
 
 export type ChaosDirection = 'c2s' | 's2c' | 'both';
+export type ChaosThrottleMode = 'per-conn' | 'shared';
 export interface ChaosProxyOptions { targetHost: string; targetPort: number }
 export interface ChaosProxyStats { connections: number; destroyed: number; bytesRelayed: number }
 export interface ChaosProxy {
@@ -18,7 +19,7 @@ export interface ChaosProxy {
   blackhole(direction?: ChaosDirection): void;
   heal(): void;
   setLatency(ms: number, jitterMs?: number): void;
-  setThrottle(bytesPerSec: number): void;
+  setThrottle(bytesPerSec: number, mode?: ChaosThrottleMode): void;
   setIdleTimeout(ms: number): void;
   flappy(intervalMs: number): void;
   stopFlappy(): void;
@@ -64,13 +65,15 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
   let latencyMs = 0;
   let jitterMs = 0;
   let throttleBps = 0; // 0 = 不限速
+  let throttleShared = false; // shared = 全连接共享一份带宽预算（模拟共享链路）
   let idleTimeoutMs = 0; // 0 = 不启用
   let rejectStatus: number | null = null;
   let flappyTimer: NodeJS.Timeout | null = null;
   let closed = false;
 
-  function pumpPipe(pipe: Pipe, budgetBytes: number): void {
-    if (pipe.blackholed) return;
+  /** 泵送一 pipe；返回本次实际转发字节数（shared 模式据以扣全局预算） */
+  function pumpPipe(pipe: Pipe, budgetBytes: number): number {
+    if (pipe.blackholed) return 0;
     let budget = budgetBytes;
     const now = Date.now();
     while (pipe.queue.length > 0 && budget > 0) {
@@ -101,18 +104,26 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
       pipe.sourcePaused = false;
       pipe.source.resume();
     }
+    return budgetBytes - budget;
   }
 
   const pumpTimer = setInterval(() => {
     const now = Date.now();
-    const budget = throttleBps > 0 ? (throttleBps * PUMP_MS) / 1000 : Number.POSITIVE_INFINITY;
+    const perPipeBudget =
+      throttleBps > 0 ? (throttleBps * PUMP_MS) / 1000 : Number.POSITIVE_INFINITY;
+    let sharedRemaining = perPipeBudget; // shared 模式：本 tick 全场共享这一份预算
     for (const conn of [...conns]) {
       if (idleTimeoutMs > 0 && now - conn.lastActivityAt > idleTimeoutMs) {
         destroyConn(conn);
         continue;
       }
-      pumpPipe(conn.c2s, budget);
-      pumpPipe(conn.s2c, budget);
+      if (throttleShared) {
+        sharedRemaining -= pumpPipe(conn.c2s, sharedRemaining);
+        sharedRemaining -= pumpPipe(conn.s2c, sharedRemaining);
+      } else {
+        pumpPipe(conn.c2s, perPipeBudget);
+        pumpPipe(conn.s2c, perPipeBudget);
+      }
       // 双向 FIN 均已传播（或对端已毁）：连接自然终结，移出在场集合
       const done = (p: Pipe): boolean => p.destEnded || p.dest.destroyed;
       if (done(conn.c2s) && done(conn.s2c)) conns.delete(conn);
@@ -235,7 +246,10 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
       }
     },
     setLatency(ms: number, jitter = 0): void { latencyMs = ms; jitterMs = jitter; },
-    setThrottle(bytesPerSec: number): void { throttleBps = bytesPerSec; },
+    setThrottle(bytesPerSec: number, mode: ChaosThrottleMode = 'per-conn'): void {
+      throttleBps = bytesPerSec;
+      throttleShared = mode === 'shared';
+    },
     setIdleTimeout(ms: number): void { idleTimeoutMs = ms; },
     flappy(intervalMs: number): void {
       if (flappyTimer) clearInterval(flappyTimer);
