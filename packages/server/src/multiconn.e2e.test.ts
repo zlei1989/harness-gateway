@@ -9,9 +9,9 @@
 import { createHash } from 'node:crypto';
 import http from 'node:http';
 
+import { Client } from 'gateway-client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { Client } from 'gateway-client';
 
 import { GatewayServer } from './server';
 

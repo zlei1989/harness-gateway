@@ -13,8 +13,8 @@ import { EventEmitter } from 'node:events';
 
 import { Connection, type ReconnectOptions, type TunnelSender } from './connection';
 
-import type { ControlFrame, DataHeader } from './protocol';
 import type { Logger } from './logger';
+import type { ControlFrame, DataHeader } from './protocol';
 
 export interface TunnelGroupOptions {
   gatewayUrl: string;

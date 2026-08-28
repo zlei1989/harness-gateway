@@ -7,8 +7,8 @@
  * 断腿=整组重建（spec §4.4）前提下 seq < expected 不可能发生，防御性丢弃 + WARN。
  */
 
-import type { ControlFrame, DataHeader } from './protocol';
 import type { Logger } from './logger';
+import type { ControlFrame, DataHeader } from './protocol';
 
 export type SequencedItem =
   | { kind: 'control'; frame: ControlFrame }
