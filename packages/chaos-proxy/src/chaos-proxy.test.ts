@@ -309,3 +309,40 @@ describe('shared 限速（setThrottle mode）', () => {
     expect(completed).toBe(true); // 两连接均收全数据 = 不停摆
   }, 10_000);
 });
+
+describe('setAdmissionRate 连接准入', () => {
+  /** 准入信号：准入放行后代理才 wirePipe，内核缓冲的 'x' 被读出经 echo 返回 */
+  function admitted(s: net.Socket): Promise<number> {
+    return new Promise<number>((resolve) => {
+      s.once('data', () => resolve(Date.now()));
+      s.write('x'); // 未 connect/未准入时内核缓冲，放行后交付
+    });
+  }
+
+  it('前 rate 个立即通，其余按间隔匀速放行', async () => {
+    await startEcho();
+    proxy = createChaosProxy({ targetHost: '127.0.0.1', targetPort: echoPort });
+    const port = await proxy.listen();
+    proxy.setAdmissionRate(4); // 满桶 4：前 4 立即通；每 250ms 补 1 名额
+    const startAt = Date.now();
+    const times = await Promise.all(Array.from({ length: 12 }, () => admitted(dial(port))));
+    const sorted = times.map((t) => t - startAt).sort((a, b) => a - b);
+    expect(sorted[3]!).toBeLessThan(200); // 前 4 立即通（泵转发 ≈10ms 级）
+    expect(sorted[11]!).toBeGreaterThanOrEqual(1500); // 第 12 个等 8 个匀速名额，理论 2s
+  }, 10_000);
+
+  it('排队中 close 不占名额；setAdmissionRate(0) 清队即放', async () => {
+    await startEcho();
+    proxy = createChaosProxy({ targetHost: '127.0.0.1', targetPort: echoPort });
+    const port = await proxy.listen();
+    proxy.setAdmissionRate(1); // 满桶 1：仅第 1 个立即通，后续排队
+    await admitted(dial(port)); // s1 占掉唯一名额，保持在线
+    const s2 = dial(port);
+    await new Promise<void>((r) => s2.on('connect', r));
+    s2.destroy(); // 排队中放弃：出队取消，不占名额
+    const s3 = dial(port);
+    proxy.setAdmissionRate(0); // 关闭准入：排队连接立即全部放行（死连接跳过）
+    await admitted(s3);
+    expect(proxy.stats().connections).toBe(2); // s1 + s3：已毁的 s2 被跳过、未建 conn
+  }, 10_000);
+});

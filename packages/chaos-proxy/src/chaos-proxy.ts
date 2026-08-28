@@ -20,6 +20,7 @@ export interface ChaosProxy {
   heal(): void;
   setLatency(ms: number, jitterMs?: number): void;
   setThrottle(bytesPerSec: number, mode?: ChaosThrottleMode): void;
+  setAdmissionRate(connPerSec: number): void;
   setIdleTimeout(ms: number): void;
   flappy(intervalMs: number): void;
   stopFlappy(): void;
@@ -68,6 +69,10 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
   let throttleShared = false; // shared = 全连接共享一份带宽预算（模拟共享链路）
   let idleTimeoutMs = 0; // 0 = 不启用
   let rejectStatus: number | null = null;
+  let admissionPerSec = 0; // 0 = 准入不限速
+  let admissionTokens = 0; // 准入令牌：满桶 = admissionPerSec（突发），匀速补充
+  const admissionQueue: net.Socket[] = []; // FIFO 准入排队
+  let admissionTimer: NodeJS.Timeout | null = null;
   let flappyTimer: NodeJS.Timeout | null = null;
   let closed = false;
 
@@ -175,6 +180,21 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
 
   const server = net.createServer((client) => {
     if (closed) { client.destroy(); return; }
+    if (admissionPerSec > 0) {
+      // 准入排队：FIFO 等放行；排队中 close 出队取消（不空耗名额）
+      admissionQueue.push(client);
+      client.once('close', () => {
+        const index = admissionQueue.indexOf(client);
+        if (index >= 0) admissionQueue.splice(index, 1);
+      });
+      drainAdmission();
+      return;
+    }
+    handleClient(client);
+  });
+
+  /** 准入后接线：reject 优先，否则对接 target 双向透传（放行才消耗 target 资源） */
+  function handleClient(client: net.Socket): void {
     if (rejectStatus !== null) { wireReject(client, rejectStatus); return; }
     const target = net.createConnection({ host: opts.targetHost, port: opts.targetPort });
     // 新 pipe 以全局黑洞标志初始化：黑洞期间新建连接同样静默
@@ -195,7 +215,18 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
     wirePipe(conn, conn.s2c);
     if (conn.c2s.blackholed) client.pause(); // 黑洞中建连：源侧即停，窗口填满
     if (conn.s2c.blackholed) target.pause();
-  });
+  }
+
+  /** 按令牌放行队首（满桶突发 + 匀速补充）；死 socket 跳过不占名额 */
+  function drainAdmission(): void {
+    while (admissionTokens > 0) {
+      const client = admissionQueue.shift();
+      if (!client) return;
+      if (client.destroyed) continue;
+      admissionTokens -= 1;
+      handleClient(client);
+    }
+  }
 
   return {
     listen(): Promise<number> {
@@ -213,6 +244,8 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
       blackholeFlags.c2s = false; // 模块级标志随实例关闭复位，防跨用例污染
       blackholeFlags.s2c = false;
       clearInterval(pumpTimer);
+      if (admissionTimer) { clearInterval(admissionTimer); admissionTimer = null; }
+      for (const client of admissionQueue.splice(0)) client.destroy(); // 排队未放行的一并收尾
       if (flappyTimer) { clearInterval(flappyTimer); flappyTimer = null; }
       for (const conn of [...conns]) destroyConn(conn);
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -250,6 +283,24 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
       throttleBps = bytesPerSec;
       // bps=0 = 不限速：shared 分支无意义且会 Infinity−Infinity=NaN 停摆，退回 per-conn Infinity 路径
       throttleShared = bytesPerSec > 0 && mode === 'shared';
+    },
+    setAdmissionRate(connPerSec: number): void {
+      admissionPerSec = connPerSec;
+      if (admissionTimer) { clearInterval(admissionTimer); admissionTimer = null; }
+      if (connPerSec <= 0) {
+        // 关闭准入：排队连接立即全部放行（死连接跳过）
+        for (const client of admissionQueue.splice(0)) {
+          if (!client.destroyed) handleClient(client);
+        }
+        return;
+      }
+      admissionTokens = connPerSec; // 满桶起步：前 connPerSec 个立即通
+      drainAdmission();
+      admissionTimer = setInterval(() => {
+        admissionTokens = Math.min(connPerSec, admissionTokens + 1); // 匀速补充，不超容量
+        drainAdmission();
+      }, Math.max(1, Math.floor(1000 / connPerSec)));
+      admissionTimer.unref();
     },
     setIdleTimeout(ms: number): void { idleTimeoutMs = ms; },
     flappy(intervalMs: number): void {
