@@ -10,7 +10,7 @@ import net from 'node:net';
 
 export type ChaosDirection = 'c2s' | 's2c' | 'both';
 export type ChaosThrottleMode = 'per-conn' | 'shared';
-export interface ChaosProxyOptions { targetHost: string; targetPort: number }
+export interface ChaosProxyOptions { targetHost: string; targetPort: number; listenPort?: number }
 export interface ChaosProxyStats { connections: number; destroyed: number; bytesRelayed: number }
 export interface ChaosProxy {
   listen(): Promise<number>;
@@ -232,7 +232,7 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
     listen(): Promise<number> {
       return new Promise((resolve, reject) => {
         server.once('error', reject);
-        server.listen(0, '127.0.0.1', () => {
+        server.listen(opts.listenPort ?? 0, '127.0.0.1', () => {
           const addr = server.address();
           if (typeof addr === 'string' || !addr) { reject(new Error('no addr')); return; }
           resolve(addr.port);

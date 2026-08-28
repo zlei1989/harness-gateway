@@ -208,6 +208,19 @@ describe('基础转发', () => {
     expect(proxy.stats().connections).toBe(1);
     expect(proxy.stats().bytesRelayed).toBe(10); // c2s 5 + s2c 5
   });
+
+  it('listenPort：固定端口监听（脚本/手动验证用）', async () => {
+    await startEcho();
+    // 先借一个随机端口再释放，作为固定端口入参（回环瞬时占用冲突概率可忽略）
+    const probe = net.createServer();
+    await new Promise<void>((r) => probe.listen(0, '127.0.0.1', r));
+    const fixedPort = (probe.address() as net.AddressInfo).port;
+    await new Promise<void>((r) => probe.close(() => r()));
+    proxy = createChaosProxy({ targetHost: '127.0.0.1', targetPort: echoPort, listenPort: fixedPort });
+    expect(await proxy.listen()).toBe(fixedPort);
+    const s = dial(fixedPort);
+    await new Promise<void>((r) => s.on('connect', r));
+  });
 });
 
 describe('flappy / rejectUpgrade', () => {

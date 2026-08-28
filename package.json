@@ -10,7 +10,7 @@
     "client": "pnpm --filter gateway-client start",
     "dev": "pnpm -r dev",
     "format": "pnpm -r format",
-    "proxy": "pnpm --filter gateway-proxy start",
+    "proxy": "pnpm --filter chaos-proxy exec tsx scripts/throttle-proxy.ts --throttle 50k --shared --admission 8",
     "server": "pnpm --filter gateway-server start",
     "test": "pnpm -r test",
     "typecheck": "pnpm -r typecheck"
