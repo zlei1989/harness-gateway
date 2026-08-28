@@ -286,4 +286,26 @@ describe('shared 限速（setThrottle mode）', () => {
     expect(elapsed).toBeGreaterThanOrEqual(800);
     expect(elapsed).toBeLessThan(2500);
   }, 10_000);
+
+  it('setThrottle(0, shared)：关闭限速不停摆（Infinity−Infinity=NaN 回归）', async () => {
+    await startEcho();
+    proxy = createChaosProxy({ targetHost: '127.0.0.1', targetPort: echoPort });
+    const port = await proxy.listen();
+    proxy.setThrottle(50_000, 'shared');
+    proxy.setThrottle(0, 'shared'); // 关闭限速：bps=0 不得留在 shared 分支（NaN 预算停摆）
+    const size = 50_000;
+    const transferred = Promise.all(
+      [dial(port), dial(port)].map((s) => new Promise<void>((resolve) => {
+        let got = 0;
+        s.on('data', (c: Buffer) => { got += c.length; if (got >= size) resolve(); });
+        s.write(Buffer.alloc(size, 0x61)); // 未 connect 时内核缓冲，建连后发出
+      })),
+    ).then(() => true);
+    // 不限速时两连接各 50KB 亚秒级收全；停摆则 3s race 出 false（断言失败而非超时错误）
+    const completed = await Promise.race([
+      transferred,
+      new Promise<boolean>((r) => setTimeout(() => r(false), 3000)),
+    ]);
+    expect(completed).toBe(true); // 两连接均收全数据 = 不停摆
+  }, 10_000);
 });

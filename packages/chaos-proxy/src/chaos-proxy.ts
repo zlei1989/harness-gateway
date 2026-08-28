@@ -248,7 +248,8 @@ export function createChaosProxy(opts: ChaosProxyOptions): ChaosProxy {
     setLatency(ms: number, jitter = 0): void { latencyMs = ms; jitterMs = jitter; },
     setThrottle(bytesPerSec: number, mode: ChaosThrottleMode = 'per-conn'): void {
       throttleBps = bytesPerSec;
-      throttleShared = mode === 'shared';
+      // bps=0 = 不限速：shared 分支无意义且会 Infinity−Infinity=NaN 停摆，退回 per-conn Infinity 路径
+      throttleShared = bytesPerSec > 0 && mode === 'shared';
     },
     setIdleTimeout(ms: number): void { idleTimeoutMs = ms; },
     flappy(intervalMs: number): void {
