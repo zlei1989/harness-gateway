@@ -16,4 +16,8 @@ export default {
   token: 'test',
   // 可选：选择成功后浏览器跳转路径，默认 '/'
   defaultPath: '/',
+  // 可选：压缩传输（默认 false）。开启后为 upstream 未压缩的可压缩响应代做 br/gzip
+  // 端到端压缩，大文本响应（日志/代码 bundle）传输量可降一个数量级；已编码/SSE/Range/
+  // 小响应/二进制类型自动透传不压。开启后无需再开服务端 --tunnel-permessage-deflate
+  compress: true,
 }

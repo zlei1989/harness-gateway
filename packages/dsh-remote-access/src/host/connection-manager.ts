@@ -53,6 +53,7 @@ export class ConnectionManager {
         gatewayUrl: endpoints.gatewayUrl,
         hostname,
         token: cfg.token,
+        compress: cfg.compress,
         logger: {
           debug: () => undefined,
           info: (m) => console.info(`${LOG_PREFIX} [INFO] ${m}`),

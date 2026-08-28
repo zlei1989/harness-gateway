@@ -34,15 +34,23 @@ describe('remote-status', () => {
     expect(cfg.hostname).toBe('');
     expect(String(cfg.token)).toMatch(/^[0-9a-zA-Z]{8}$/);
     expect(cfg.gateway).toBe('harness-gateway.7qbjs.com');
+    expect(cfg.compress).toBe(true); // 压缩传输默认开
     expect(res.connection).toEqual({ state: 'off' });
   });
 });
 
 describe('remote-save-config', () => {
-  it('合法保存后 loadConfig 可读到', async () => {
-    const res = await call('remote-save-config', { hostname: 'my-pc', token: 'aB3x9Kq2', gateway: 'https://gw.example.com' });
+  it('合法保存后 loadConfig 可读到（含 compress 开关）', async () => {
+    const res = await call('remote-save-config', { hostname: 'my-pc', token: 'aB3x9Kq2', gateway: 'https://gw.example.com', compress: false });
     expect(res.ok).toBe(true);
-    expect(loadConfig(home)).toEqual({ hostname: 'my-pc', token: 'aB3x9Kq2', gateway: 'https://gw.example.com' });
+    expect(loadConfig(home)).toEqual({ hostname: 'my-pc', token: 'aB3x9Kq2', gateway: 'https://gw.example.com', compress: false });
+  });
+
+  it('compress 缺省：回落已保存值（表单未携带该字段时不清空开关）', async () => {
+    await call('remote-save-config', { hostname: 'my-pc', token: 'aB3x9Kq2', gateway: 'https://gw.example.com', compress: false });
+    const res = await call('remote-save-config', { hostname: 'my-pc-2' });
+    expect(res.ok).toBe(true);
+    expect(loadConfig(home)).toEqual({ hostname: 'my-pc-2', token: 'aB3x9Kq2', gateway: 'https://gw.example.com', compress: false });
   });
 
   it('非法网关地址：ok=false 且不写文件', async () => {

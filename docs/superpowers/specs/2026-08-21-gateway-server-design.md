@@ -193,6 +193,8 @@ cookie 检查：无/失效 gateway_sid → 302 selectPath
 浏览器中途断开 → channel.close 通知客户端取消
 ```
 
+- **content-encoding 透传（2026-08-28 补记）**：服务端不解码、不重编码响应体，`content-encoding` 属端到端头随 `http.head` 原样回写浏览器。客户端开启压缩传输（compress，见客户端 spec §5.1）时 br/gzip 字节流经隧道原样送达浏览器由其原生解码；压缩后 `content-length` 已被客户端删除，回写时由 Node 自动退化 chunked。
+
 ### 7.2 浏览器 WS upgrade（ws-proxy.ts）
 
 - cookie 检查同上；**无/失效 cookie → HTTP 401 + destroy**（WS 握手无法 302）

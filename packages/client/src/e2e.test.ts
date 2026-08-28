@@ -6,6 +6,7 @@
  */
 
 import { createServer, type Server } from 'node:http';
+import zlib from 'node:zlib';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { WebSocketServer } from 'ws';
@@ -34,6 +35,13 @@ beforeEach(async () => {
     if (req.url === '/multi-cookie') {
       res.writeHead(200, { 'set-cookie': ['a=1', 'b=2'] });
       res.end('ok');
+      return;
+    }
+    if (req.url === '/big-log') {
+      // 大文本日志响应（显式 content-length > 1KB，命中压缩路径）
+      const body = 'log line 0123456789 abcdef\n'.repeat(2000);
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'content-length': String(Buffer.byteLength(body)) });
+      res.end(body);
       return;
     }
     res.writeHead(200, { 'content-type': 'text/plain' });
@@ -148,6 +156,39 @@ describe('e2e：隧道全链路', () => {
     expect(b1.payload.equals(Buffer.from([1, 2, 3]))).toBe(true);
     expect(b2.dataType).toBe('text');
     expect(b2.payload.toString()).toBe('hello-B');
+    await client.close();
+  });
+
+  it('压缩传输全链路：compress 开启后大文本响应经隧道端到端 br 压缩，浏览器侧可解码还原', async () => {
+    const client = await makeClient({ compress: true });
+    const res = await gateway.request('GET', '/big-log', {
+      authorization: 'Bearer t1', 'accept-encoding': 'gzip, deflate, br',
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers['content-encoding']).toBe('br');
+    expect(res.headers['content-length']).toBeUndefined(); // 压缩后长度变化，须已删除
+    const decoded = zlib.brotliDecompressSync(res.body).toString();
+    expect(decoded).toBe('log line 0123456789 abcdef\n'.repeat(2000));
+    await client.close();
+  });
+
+  it('压缩传输全链路：compress 关闭时大文本响应原样透传（负向对照）', async () => {
+    const client = await makeClient();
+    const res = await gateway.request('GET', '/big-log', {
+      authorization: 'Bearer t1', 'accept-encoding': 'gzip, deflate, br',
+    });
+    expect(res.headers['content-encoding']).toBeUndefined();
+    expect(res.headers['content-length']).toBe(String(Buffer.byteLength('log line 0123456789 abcdef\n'.repeat(2000))));
+    await client.close();
+  });
+
+  it('压缩传输全链路：SSE 响应不压缩（事件流原样分块到达）', async () => {
+    const client = await makeClient({ compress: true });
+    const res = await gateway.request('GET', '/sse', {
+      authorization: 'Bearer t1', 'accept-encoding': 'gzip, deflate, br',
+    });
+    expect(res.headers['content-encoding']).toBeUndefined();
+    expect(res.body.toString()).toBe('data: 1\n\ndata: 2\n\ndata: 3\n\n');
     await client.close();
   });
 

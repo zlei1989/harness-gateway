@@ -22,7 +22,7 @@ export interface HandlerDeps {
 const LOG_PREFIX = '[dsh-remote-access]';
 
 function toDto(cfg: RemoteAccessConfig): RemoteAccessConfigDto {
-  return { hostname: cfg.hostname, token: cfg.token, gateway: cfg.gateway };
+  return { hostname: cfg.hostname, token: cfg.token, gateway: cfg.gateway, compress: cfg.compress };
 }
 
 /** 从表单参数提取配置（缺省字段回落到已保存配置/默认值）。 */
@@ -34,6 +34,7 @@ function configFromParams(
     hostname: typeof params.hostname === 'string' ? params.hostname : base.hostname,
     token: typeof params.token === 'string' ? params.token : base.token,
     gateway: typeof params.gateway === 'string' ? params.gateway : base.gateway,
+    compress: typeof params.compress === 'boolean' ? params.compress : base.compress,
   };
 }
 

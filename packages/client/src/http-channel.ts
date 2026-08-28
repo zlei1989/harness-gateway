@@ -7,12 +7,52 @@
 
 import http from 'node:http';
 import https from 'node:https';
+import { type Readable } from 'node:stream';
+import zlib from 'node:zlib';
 
 import { type AuthDecision, type AuthRequest, buildAuthRequest } from './authorize';
 import { type ChannelCloseFrame, type HeadersJson, type HttpOpenFrame, normalizeHeaders, stripHopByHop } from './protocol';
 
 import type { Connection } from './connection';
 import type { Logger } from './logger';
+
+/**
+ * 压缩下限：upstream 声明 content-length 且小于该值时不压缩
+ * （小 body 压缩无收益还白付 CPU；chunked 流式响应无 content-length，按 content-type 判断压缩）
+ */
+const MIN_COMPRESS_BYTES = 1024;
+/** Brotli 质量 4：与 gzip-6 相当的速度、更好的文本压缩率（15MB 级日志场景的质量/速度甜点） */
+const BROTLI_QUALITY = 4;
+
+/** 可压缩的 content-type：文本类、JSON/XML 族、SVG；SSE 显式排除（压缩会延迟事件推送） */
+const COMPRESSIBLE_TYPE = new RegExp(
+  '^(?:text\\/(?!event-stream)|application\\/(?:json|javascript|x-javascript|xml|x-ndjson|wasm)'
+  + '|image\\/svg\\+xml|[^;]+\\+(?:json|xml)\\b)',
+  'i',
+);
+
+/** 从浏览器 Accept-Encoding 协商压缩算法：br 优先（压缩率更高），其次 gzip；都不支持则不压缩 */
+function negotiateEncoding(acceptEncoding: string | string[] | undefined): 'br' | 'gzip' | null {
+  if (acceptEncoding === undefined) return null;
+  const value = Array.isArray(acceptEncoding) ? acceptEncoding.join(', ') : acceptEncoding;
+  if (/(?:^|[\s,])br(?:[\s,;]|$)/i.test(value)) return 'br';
+  if (/(?:^|[\s,])gzip(?:[\s,;]|$)/i.test(value)) return 'gzip';
+  return null;
+}
+
+/** 判定 content-type 是否可压缩（缺省/二进制类型不压缩，避免对图片、压缩包白费 CPU） */
+function isCompressibleType(contentType: string | string[] | undefined): boolean {
+  if (contentType === undefined) return false;
+  const value = Array.isArray(contentType) ? contentType[0] : contentType;
+  return COMPRESSIBLE_TYPE.test(value ?? '');
+}
+
+/** 在 Vary 中追加 accept-encoding（已有则不动；保证共享缓存按编码协商键隔离） */
+function mergeVary(vary: string | string[] | undefined): string {
+  const existing = vary === undefined ? [] : (Array.isArray(vary) ? vary : vary.split(',')).map((v) => v.trim()).filter(Boolean);
+  if (!existing.some((v) => v.toLowerCase() === 'accept-encoding')) existing.push('accept-encoding');
+  return existing.join(', ');
+}
 
 export interface HttpChannelParams {
   id: number;
@@ -26,6 +66,12 @@ export interface HttpChannelParams {
    * 缺省时走 Node 全局 Agent。注意运行时实例与 upstream 协议一一对应。
    */
   agent?: http.Agent;
+  /**
+   * 压缩传输：为 upstream 未压缩的可压缩响应代做端到端压缩（br/gzip，按浏览器
+   * Accept-Encoding 协商），一次压缩覆盖 client→server→browser 两段链路。
+   * 已编码/SSE/Range/小响应/二进制类型不压（见 negotiateCompression）。默认关闭。
+   */
+  compress?: boolean;
   /** 通道结束（完成/被拒/出错/取消）时回调，Client 用它从通道表移除 */
   onDone: (id: number) => void;
 }
@@ -45,6 +91,8 @@ export class HttpChannel {
   /** 发起 upstream 请求的目标与加工后的 headers（陈旧连接重试时复用，start 阶段准备一次） */
   private preparedTarget: URL | null = null;
   private preparedHeaders: HeadersJson | null = null;
+  /** 压缩变换流（压缩路径下位于 res 与隧道发送之间）：通道中止时随 upstream 一并销毁 */
+  private compressor: zlib.BrotliCompress | zlib.Gzip | null = null;
 
   constructor(private readonly params: HttpChannelParams) {}
 
@@ -165,25 +213,69 @@ export class HttpChannel {
     if (this.finished) return;
     const { connection } = this.params;
     const headers = stripHopByHop(normalizeHeaders(res.headers));
+
+    // 压缩协商（compress 开启时）：代 upstream 做端到端压缩，一次压缩覆盖 client→server→browser。
+    // 服务端对 body 与端到端头完全透明（只注入 Authorization/剥会话 cookie/剥逐跳头），
+    // 改写 content-encoding + 删 content-length（压缩后长度变化，服务端自动退化 chunked）即可。
+    const encoding = this.negotiateCompression(res, headers);
+    let source: Readable = res;
+    if (encoding !== null) {
+      headers['content-encoding'] = encoding;
+      delete headers['content-length'];
+      headers['vary'] = mergeVary(headers['vary']);
+      this.compressor = encoding === 'br'
+        ? zlib.createBrotliCompress({
+          params: { [zlib.constants.BROTLI_PARAM_QUALITY]: BROTLI_QUALITY },
+        })
+        : zlib.createGzip();
+      // 压缩流错误（内存不足等极端情况）：通道级失败，与 upstream 流错误同级
+      this.compressor.on('error', (err) => this.fail(`压缩流错误: ${err.message}`));
+      // pipe 串联背压：压缩流写入侧满时自动 pause upstream，无需手工衔接
+      source = res.pipe(this.compressor);
+    }
+
     if (!this.trySend(() => connection.sendControl({ type: 'http.head', channelId: this.params.id, status: res.statusCode ?? 502, headers }))) return;
     this.headSent = true;
-    res.on('data', (chunk: Buffer) => {
+    source.on('data', (chunk: Buffer) => {
       if (this.finished) return;
       // 无需 exceedsMaxDataFrame 护栏：chunk 来自 Node 流读取（≪100MiB），数学上不可能超隧道帧上限；
       // encodeData 的 PayloadTooLargeError 兜底由 trySend 消化为通道级中止（护栏在 ws-channel 的 WS 消息路径）
       let ok = true;
       if (!this.trySend(() => { ok = connection.sendData({ channelId: this.params.id, kind: 'http.body' }, chunk); })) return;
       if (!ok) {
-        res.pause();
-        void connection.waitDrain().then(() => { if (!this.finished) res.resume(); });
+        // 压缩路径下 pause 的是压缩流（可读侧），其内部缓冲写满后经 pipe 反压 upstream，语义等价
+        source.pause();
+        void connection.waitDrain().then(() => { if (!this.finished) source.resume(); });
       }
     });
-    res.on('end', () => {
+    source.on('end', () => {
       if (this.finished) return;
       this.trySend(() => connection.sendData({ channelId: this.params.id, kind: 'http.body.end' }, Buffer.alloc(0)));
       this.done();
     });
     res.on('error', (err) => this.fail(`upstream 响应流错误: ${err.message}`));
+  }
+
+  /**
+   * 压缩协商：满足全部条件才返回压缩算法，任一不满足即原样透传——
+   * ① 通道开启 compress；② 浏览器 Accept-Encoding 支持 br/gzip；③ upstream 未自行编码；
+   * ④ 有 body（排除 HEAD/204/304）；⑤ 非 Range 请求（压缩会破坏字节区间语义）；
+   * ⑥ content-type 可压缩；⑦ content-length 缺省（流式大 body）或 ≥ 1KB。
+   */
+  private negotiateCompression(res: http.IncomingMessage, headers: HeadersJson): 'br' | 'gzip' | null {
+    if (this.params.compress !== true) return null;
+    if (headers['content-encoding'] !== undefined) return null;
+    const status = res.statusCode ?? 0;
+    if (status === 204 || status === 304 || this.params.open.method.toUpperCase() === 'HEAD') return null;
+    if (this.params.open.headers['range'] !== undefined) return null;
+    if (!isCompressibleType(headers['content-type'])) return null;
+    const contentLength = headers['content-length'];
+    if (contentLength !== undefined) {
+      const raw = Array.isArray(contentLength) ? contentLength[0]! : contentLength;
+      const size = Number.parseInt(raw, 10);
+      if (Number.isFinite(size) && size < MIN_COMPRESS_BYTES) return null;
+    }
+    return negotiateEncoding(this.params.open.headers['accept-encoding']);
   }
 
   /** upstream 请求错误：陈旧 keep-alive 连接按一次性重试换新；未回响应头 → 502；已回 → 通道级错误帧 */
@@ -250,6 +342,9 @@ export class HttpChannel {
 
   private destroyUpstream(): void {
     this.req?.destroy();
+    // 压缩流随 upstream 一并销毁：pipe 不会自动关目的端，残留变换流会滞留内部缓冲
+    this.compressor?.destroy();
+    this.compressor = null;
   }
 
   private done(): void {

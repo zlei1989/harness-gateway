@@ -29,6 +29,11 @@ export interface ClientOptions {
   defaultPath?: string;
   /** Express 中间件风格鉴权钩子；选择页探测（/__gateway__/auth-check）也走此钩子 */
   authorization?: AuthorizationHook;
+  /**
+   * 压缩传输：为 upstream 未压缩的可压缩响应代做端到端压缩（br/gzip，按浏览器
+   * Accept-Encoding 协商），显著降低大文本响应（日志/代码 bundle）的隧道传输量。默认关闭。
+   */
+  compress?: boolean;
   reconnect?: Partial<ReconnectOptions>;
   heartbeatIntervalMs?: number;
   authTimeoutMs?: number;
@@ -57,6 +62,8 @@ export class Client extends EventEmitter {
   private readonly agent: http.Agent;
   private readonly authorize: (req: AuthRequest) => Promise<AuthDecision>;
   private readonly logger: Logger;
+  /** 压缩传输开关（HttpChannel 压缩协商总闸） */
+  private readonly compress: boolean;
   private closing = false;
 
   constructor(options: ClientOptions) {
@@ -83,6 +90,7 @@ export class Client extends EventEmitter {
     }
 
     this.logger = options.logger ?? createDefaultLogger();
+    this.compress = options.compress ?? false;
     const authTimeoutMs = options.authTimeoutMs ?? 30_000;
     // 默认 Bearer 装配下沉在 runAuthorization 内：无钩子且有 token → 内置校验；有钩子 → 钩子为准
     this.authorize = (req) =>
@@ -188,7 +196,7 @@ export class Client extends EventEmitter {
     const channel = new HttpChannel({
       id: frame.channelId, open: frame, upstream: this.upstream,
       connection: this.connection, authorize: this.authorize, logger: this.logger,
-      agent: this.agent,
+      agent: this.agent, compress: this.compress,
       onDone: (id) => this.channels.delete(id),
     });
     this.channels.set(frame.channelId, channel);

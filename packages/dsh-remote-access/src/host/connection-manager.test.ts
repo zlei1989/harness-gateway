@@ -3,11 +3,25 @@
  * 驱动真实 gateway-client 完成握手，验证状态机与 tunnelId/深链。
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebSocketServer } from 'ws';
 
 
 import { ConnectionManager } from './connection-manager';
+
+/** 捕获 ConnectionManager 构造 gateway-client Client 时传入的完整 options（验证配置透传） */
+const capturedClientOptions = vi.hoisted(() => [] as Record<string, unknown>[]);
+vi.mock('gateway-client', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('gateway-client')>();
+  // 包一层捕获壳，行为仍是真实 Client（状态机用例不受影响）
+  class CapturingClient extends mod.Client {
+    constructor(options: ConstructorParameters<typeof mod.Client>[0]) {
+      capturedClientOptions.push(options as unknown as Record<string, unknown>);
+      super(options);
+    }
+  }
+  return { ...mod, Client: CapturingClient };
+});
 
 /** 最小 mock 网关：讲隧道控制帧的 ws 服务端（控制帧为 JSON 文本帧）。 */
 class HelloMockGateway {
@@ -53,7 +67,7 @@ afterEach(async () => {
   await gateway.close();
 });
 
-const cfg = (gatewayAddr: string) => ({ hostname: '', token: 'tok12345', gateway: gatewayAddr });
+const cfg = (gatewayAddr: string, compress = true) => ({ hostname: '', token: 'tok12345', gateway: gatewayAddr, compress });
 
 describe('ConnectionManager', () => {
   it('初始状态为 off', () => {
@@ -76,8 +90,15 @@ describe('ConnectionManager', () => {
     expect(again.tunnelId).toBe('tid-test-1');
   });
 
-  it('非法网关地址：enable 抛错，状态保持 off', async () => {
-    await expect(manager.enable(cfg(''))).rejects.toThrow(/不能为空/);
+  it('enable 将 compress 开关原样透传给 gateway-client 构造参数', async () => {
+    capturedClientOptions.length = 0;
+    await manager.enable(cfg(gateway.url, false));
+    await manager.enable(cfg(gateway.url, true));
+    expect(capturedClientOptions[0]).toMatchObject({ compress: false });
+    expect(capturedClientOptions[1]).toMatchObject({ compress: true });
+  });
+
+  it('非法网关地址：enable 抛错，状态保持 off', async () => {    await expect(manager.enable(cfg(''))).rejects.toThrow(/不能为空/);
     expect(manager.status.state).toBe('off');
   });
 

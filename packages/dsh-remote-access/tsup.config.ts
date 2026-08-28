@@ -21,7 +21,12 @@ const CLIENT_FOOTER = `
 
 export default defineConfig([
   {
-    // host 半：gateway-client（workspace TS 源码）与 yaml 一并打包；ws 保持 external
+    // host 半（Node 运行时）：只内联 gateway-client——workspace:* 协议独立安装时无法解析；
+    // ws / yaml 保持外置（semver 依赖，经 node_modules 解析）。
+    // 切勿内联 yaml：它是纯 CJS 包，esbuild 打进 ESM 产物会把其内部 require('process')
+    // 转成 __require 垫片，运行时抛 "Dynamic require of process is not supported"（线上已发生）。
+    // 注意 noExternal 必须显式列出：tsup 默认把 package.json dependencies 全部外置
+    // （externals drift 根因——注释声称内联但未配 noExternal，产物残留裸导入）
     name: 'host',
     entry: { index: 'src/host/index.ts' },
     outDir: 'lib',
@@ -29,13 +34,15 @@ export default defineConfig([
     platform: 'node',
     target: 'es2022',
     external: ['ws'],
+    noExternal: ['gateway-client'],
     outExtension: () => ({ js: '.js' }),
     clean: true,
     sourcemap: false,
     dts: false,
   },
   {
-    // client 半：qrcode-generator 等全部内联；react 由浏览器模块表运行时提供
+    // client 半：qrcode-generator 等全部内联（noExternal 覆盖 tsup 的 dependencies 自动外置）；
+    // react 由浏览器模块表运行时提供
     name: 'client',
     entry: { client: 'src/client/index.ts' },
     outDir: 'lib',
@@ -43,6 +50,7 @@ export default defineConfig([
     platform: 'browser',
     target: 'es2020',
     external: ['react'],
+    noExternal: ['qrcode-generator'],
     outExtension: () => ({ js: '.js' }),
     clean: false,
     sourcemap: false,

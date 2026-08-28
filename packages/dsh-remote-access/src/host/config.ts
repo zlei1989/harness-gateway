@@ -18,6 +18,8 @@ export interface RemoteAccessConfig {
   token: string;
   /** 网关地址 */
   gateway: string;
+  /** 压缩传输：为 upstream 未压缩的可压缩响应代做 br/gzip 端到端压缩 */
+  compress: boolean;
 }
 
 export const DEFAULT_GATEWAY = 'harness-gateway.7qbjs.com';
@@ -26,9 +28,9 @@ export function configPath(homeDir: string): string {
   return join(homeDir, '.dsh', '.remote-access.yaml');
 }
 
-/** 默认配置：主机名空（用环境主机名）、token 随机生成、网关为默认地址。 */
+/** 默认配置：主机名空（用环境主机名）、token 随机生成、网关为默认地址、压缩传输开启。 */
 export function defaultConfig(): RemoteAccessConfig {
-  return { hostname: '', token: randomToken(8), gateway: DEFAULT_GATEWAY };
+  return { hostname: '', token: randomToken(8), gateway: DEFAULT_GATEWAY, compress: true };
 }
 
 /**
@@ -48,9 +50,11 @@ export function loadConfig(homeDir: string): RemoteAccessConfig {
     hostname: typeof raw.hostname === 'string' ? raw.hostname : '',
     token: typeof raw.token === 'string' && /^[0-9a-zA-Z]+$/.test(raw.token) ? raw.token : randomToken(8),
     gateway: typeof raw.gateway === 'string' && raw.gateway.trim() ? raw.gateway : DEFAULT_GATEWAY,
+    compress: typeof raw.compress === 'boolean' ? raw.compress : true,
   };
   // 补全了缺省字段则落盘（token 等默认值生成一次后稳定）
-  if (cfg.hostname !== raw.hostname || cfg.token !== raw.token || cfg.gateway !== raw.gateway) {
+  if (cfg.hostname !== raw.hostname || cfg.token !== raw.token || cfg.gateway !== raw.gateway
+    || cfg.compress !== raw.compress) {
     saveConfig(homeDir, cfg);
   }
   return cfg;

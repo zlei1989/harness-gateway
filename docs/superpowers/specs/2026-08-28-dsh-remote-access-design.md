@@ -2,6 +2,7 @@
 
 日期：2026-08-28
 状态：已批准（brainstorming 设计评审通过）
+修订：2026-08-28 第二轮——新增「压缩传输」：yaml 配置 `compress` 字段（默认开）、设置面板「网关地址」下方 switch、`Client` 构造透传 gateway-client 的压缩能力（客户端 spec §5.1）。
 
 ## 1. 目标
 
@@ -39,10 +40,9 @@ packages/dsh-remote-access/
 
 ### 依赖策略
 
-- `gateway-client` 是 TS 源码直出（`exports["."] = "./src/index.ts"`）：host bundle 由 tsup 直接编译打包其源码进 `lib/index.js`，无需 gateway-client 自身构建。
-- `ws`（gateway-client 的运行时依赖）在 host bundle 中保持 external，并声明为 `dsh-remote-access` 自身 dependency——插件以 workspace 包运行时可经 node_modules 解析。
-- `yaml`（配置序列化）打包进 host bundle。
-- `qrcode-generator` 打包进 client bundle（纯 JS，约 20KB，离线可用），`react` 由浏览器模块表运行时提供（external）。
+- `gateway-client` 是 TS 源码直出（`exports["."] = "./src/index.ts"`）：host bundle 由 tsup 直接编译打包其源码进 `lib/index.js`，无需 gateway-client 自身构建。必须经 tsup `noExternal` 显式内联——`workspace:*` 协议独立安装时无法解析；且 tsup 默认把 package.json dependencies 全部自动外置，不配 `noExternal` 就是 externals drift（2026-08-28 线上事故根因之一）。
+- `ws`（gateway-client 的运行时依赖）与 `yaml`（配置序列化）在 host bundle 中保持 external，并声明为 `dsh-remote-access` 自身 dependency——插件以 workspace 包运行时可经 node_modules 解析。**yaml 不得内联**：它是纯 CJS 包，esbuild 打进 ESM 产物会把其内部 `require('process')` 转成 `__require` 垫片，运行时抛 "Dynamic require of process is not supported"（2026-08-28 线上事故根因之二）。
+- `qrcode-generator` 必须经 `noExternal` 内联进 client bundle（纯 JS，约 20KB，离线可用）：浏览器模块表无包解析能力，残留裸 require 即插件整页加载失败；`react` 由浏览器模块表运行时提供（external）。构建后由 `scripts/verify-bundle.mjs` 对产物做反向断言兜底（client 仅允许 react；host 仅允许 ws/yaml）。
 
 ## 3. Host 半（Cordis 插件）
 
@@ -56,6 +56,7 @@ packages/dsh-remote-access/
 hostname: ""          # 空 = 取 os.hostname()
 token: "aB3x9Kq2"     # 首次缺省时自动生成 8 位 [0-9a-zA-Z]
 gateway: "harness-gateway.7qbjs.com"
+compress: true        # 压缩传输（br/gzip 端到端压缩，2026-08-28 第二轮新增；旧版配置缺省补全为 true）
 ```
 
 规则：
@@ -79,7 +80,7 @@ gateway: "harness-gateway.7qbjs.com"
 
 ### 3.3 隧道客户端生命周期
 
-- `remote-enable`：读取当前配置 → `new Client({ upstreamUrl, gatewayUrl, hostname: config.hostname || os.hostname(), token })`；`upstreamUrl = 'http://127.0.0.1:' + webServer.port`（当前 DSH web 服务地址，环回即可，隧道在本进程内转发）。
+- `remote-enable`：读取当前配置 → `new Client({ upstreamUrl, gatewayUrl, hostname: config.hostname || os.hostname(), token, compress: config.compress })`；`upstreamUrl = 'http://127.0.0.1:' + webServer.port`（当前 DSH web 服务地址，环回即可，隧道在本进程内转发）。`compress` 为 gateway-client 的压缩传输开关（见客户端 spec §5.1：为 upstream 未压缩的可压缩响应代做 br/gzip 端到端压缩）。
 - 挂 `connected` / `disconnected` / `error` 监听维护状态机：`off | connecting | connected | error`；`connected` 后读取 `client.tunnelId`（hello.ack 下发）。
 - `remote-disable`：`client.close()` 并置 `off`。
 - 已连接时再次 `remote-enable`（如配置变更后重新打开开关）：先 close 旧实例再新建。
@@ -90,8 +91,8 @@ gateway: "harness-gateway.7qbjs.com"
 
 注册 `POST /dsh-remote-access/invoke`（exact 路由，形态同参考插件）：body `{ method, params }` → JSON 结果。方法：
 
-- `remote-status` → `{ ok, config: { hostname, token, gateway }, connection: { state, tunnelId?, error? }, selectUrl? }`；`selectUrl` 在 connected 时给出完整深链。
-- `remote-save-config` `{ hostname?, token?, gateway? }` → 校验（token 非空且符合字符集、gateway 可解析）→ 写 yaml → `{ ok }` 或 `{ ok: false, error }`。
+- `remote-status` → `{ ok, config: { hostname, token, gateway, compress }, connection: { state, tunnelId?, error? }, selectUrl? }`；`selectUrl` 在 connected 时给出完整深链。
+- `remote-save-config` `{ hostname?, token?, gateway?, compress? }` → 校验（token 非空且符合字符集、gateway 可解析）→ 写 yaml → `{ ok }` 或 `{ ok: false, error }`；缺省字段回落已保存值。
 - `remote-enable` / `remote-disable` → `{ ok, connection }` 或 `{ ok: false, error }`。
 
 ## 4. Client 半（设置页 UI）
@@ -110,8 +111,9 @@ ctx.slots.register(
 1. **主机名称** input —— 空值表示用环境主机名（placeholder 显示当前 `os.hostname()` 由 status 下发）。
 2. **令牌密钥** input + 右侧「生成」按钮 —— 前端生成 8 位 `[0-9a-zA-Z]` 随机串填入输入框。
 3. **网关地址** textarea —— 默认 `harness-gateway.7qbjs.com`。
-4. **启用** switch —— 默认关；打开即调 `remote-enable`，关闭调 `remote-disable`。
-5. 连接成功（state === 'connected' 且有 tunnelId）后下方展示：
+4. **压缩传输** switch —— 默认开；切换即保存（无失焦时机），控制 gateway-client 的 br/gzip 端到端压缩。
+5. **启用** switch —— 默认关；打开即调 `remote-enable`，关闭调 `remote-disable`。
+6. 连接成功（state === 'connected' 且有 tunnelId）后下方展示：
    - 二维码（`qrcode-generator` 生成 SVG，内容为 `selectUrl`）；
    - 「立即查看」文字按钮 —— `window.open(selectUrl, '_blank')` 弹出新窗口。
 
@@ -153,5 +155,5 @@ dsh plugin --profile web add <repo>/packages/dsh-remote-access
 
 - 不做启用状态持久化 / 开机自连（用户明确要求每次手动）。
 - 不做多网关配置、不做 token 加密存储。
-- 不改 harness-gateway 服务端与 client 包任何代码（tunnelId 深链、`Client` API 均已具备）。
+- ~~不改 harness-gateway 服务端与 client 包任何代码~~（2026-08-28 第二轮修订：压缩传输为 `gateway-client` 新增 `ClientOptions.compress` 可选字段与 `HttpChannel` 压缩协商，属向后兼容的纯增量；服务端保持透明透传零改动）。
 - 不做移动端适配的选择页改造（网关侧已有）。

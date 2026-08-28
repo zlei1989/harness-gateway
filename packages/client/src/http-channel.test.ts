@@ -7,6 +7,7 @@
 import { createServer, type RequestListener, type Server } from 'node:http';
 import http from 'node:http';
 import net from 'node:net';
+import zlib from 'node:zlib';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -356,5 +357,161 @@ describe('HttpChannel', () => {
     sendSecond!();
     await new Promise((r) => setTimeout(r, 100));
     expect(done).toBe(1);
+  });
+});
+
+describe('HttpChannel 压缩传输（compress）', () => {
+  /** 可压缩大文本体（>1KB，绕过小响应跳过规则） */
+  const BIG_TEXT = 'log line 0123456789 abcdef\n'.repeat(2000); // ≈54KB
+  const ACCEPT_BR = { 'accept-encoding': 'gzip, deflate, br' };
+
+  /** 收集通道回传的 body 帧拼合结果 */
+  function collectBody(conn: FakeConnection): Buffer {
+    return Buffer.concat(conn.data.filter((d) => d.header.kind === 'http.body').map((d) => d.payload));
+  }
+
+  function headOf(conn: FakeConnection): Extract<ControlFrame, { type: 'http.head' }> {
+    const head = conn.controls.find((f) => f.type === 'http.head');
+    if (!head || head.type !== 'http.head') throw new Error('未发出 http.head');
+    return head;
+  }
+
+  /** 起一个回 BIG_TEXT 的 upstream，headers 可由用例定制 */
+  async function startTextUpstream(
+    extraHeaders: Record<string, string> = {},
+  ): Promise<{ url: URL }> {
+    const up = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', ...extraHeaders });
+      res.end(BIG_TEXT);
+    });
+    cleanup = up.server;
+    return up;
+  }
+
+  async function runChannel(
+    conn: FakeConnection, upstream: URL,
+    openOverrides: Partial<HttpOpenFrame> = {}, compress = true,
+  ): Promise<void> {
+    const ch = new HttpChannel({
+      id: 1, open: makeOpen({ headers: { host: 'gateway.example', ...ACCEPT_BR }, ...openOverrides }),
+      upstream, connection: conn.asConnection(), authorize: ALLOW, logger: nullLogger,
+      compress, onDone: () => {},
+    });
+    await ch.start();
+    ch.onBodyEnd();
+    await new Promise((r) => setTimeout(r, 100));
+  }
+
+  it('accept-encoding 含 br：以 br 压缩回传，head 改写 content-encoding/删 content-length/补 vary，body 解码后还原', async () => {
+    const up = await startTextUpstream({ vary: 'origin' });
+    const conn = new FakeConnection();
+    await runChannel(conn, up.url);
+    const head = headOf(conn);
+    expect(head.headers['content-encoding']).toBe('br');
+    expect(head.headers['content-length']).toBeUndefined();
+    expect(head.headers['vary']).toBe('origin, accept-encoding');
+    expect(zlib.brotliDecompressSync(collectBody(conn)).toString()).toBe(BIG_TEXT);
+    expect(conn.data.at(-1)?.header.kind).toBe('http.body.end');
+  });
+
+  it('accept-encoding 仅 gzip：回落 gzip 压缩', async () => {
+    const up = await startTextUpstream();
+    const conn = new FakeConnection();
+    await runChannel(conn, up.url, { headers: { host: 'gateway.example', 'accept-encoding': 'gzip, deflate' } });
+    const head = headOf(conn);
+    expect(head.headers['content-encoding']).toBe('gzip');
+    expect(zlib.gunzipSync(collectBody(conn)).toString()).toBe(BIG_TEXT);
+  });
+
+  it('compress 未开启（默认）：即使浏览器支持 br 也原样透传', async () => {
+    const up = await startTextUpstream();
+    const conn = new FakeConnection();
+    await runChannel(conn, up.url, {}, false);
+    const head = headOf(conn);
+    expect(head.headers['content-encoding']).toBeUndefined();
+    expect(collectBody(conn).toString()).toBe(BIG_TEXT);
+  });
+
+  it('upstream 已编码（content-encoding: gzip）：不重复压缩，字节原样透传', async () => {
+    const gzipped = zlib.gzipSync(BIG_TEXT);
+    const up = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/plain', 'content-encoding': 'gzip' });
+      res.end(gzipped);
+    });
+    cleanup = up.server;
+    const conn = new FakeConnection();
+    await runChannel(conn, up.url);
+    const head = headOf(conn);
+    expect(head.headers['content-encoding']).toBe('gzip');
+    expect(collectBody(conn).equals(gzipped)).toBe(true);
+  });
+
+  it('text/event-stream（SSE）：不压缩，原样透传', async () => {
+    const up = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end(`data: ${'x'.repeat(2048)}\n\n`);
+    });
+    cleanup = up.server;
+    const conn = new FakeConnection();
+    await runChannel(conn, up.url);
+    expect(headOf(conn).headers['content-encoding']).toBeUndefined();
+  });
+
+  it('小响应（content-length < 1KB）：不压缩', async () => {
+    const up = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-length': '11' });
+      res.end('{"ok":true}');
+    });
+    cleanup = up.server;
+    const conn = new FakeConnection();
+    await runChannel(conn, up.url);
+    const head = headOf(conn);
+    expect(head.headers['content-encoding']).toBeUndefined();
+    expect(head.headers['content-length']).toBe('11');
+    expect(collectBody(conn).toString()).toBe('{"ok":true}');
+  });
+
+  it('Range 请求：不压缩（压缩会破坏字节区间语义）', async () => {
+    const up = await startUpstream((req, res) => {
+      expect(req.headers.range).toBe('bytes=0-99');
+      res.writeHead(206, {
+        'content-type': 'text/plain',
+        'content-range': `bytes 0-99/${BIG_TEXT.length}`,
+        'content-length': '100',
+      });
+      res.end(BIG_TEXT.slice(0, 100));
+    });
+    cleanup = up.server;
+    const conn = new FakeConnection();
+    await runChannel(conn, up.url, {
+      headers: { host: 'gateway.example', ...ACCEPT_BR, range: 'bytes=0-99' },
+    });
+    const head = headOf(conn);
+    expect(head.status).toBe(206);
+    expect(head.headers['content-encoding']).toBeUndefined();
+    expect(head.headers['content-length']).toBe('100');
+  });
+
+  it('不可压缩 content-type（image/png）：不压缩', async () => {
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47]), Buffer.alloc(4096, 7)]);
+    const up = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'image/png' });
+      res.end(png);
+    });
+    cleanup = up.server;
+    const conn = new FakeConnection();
+    await runChannel(conn, up.url);
+    expect(headOf(conn).headers['content-encoding']).toBeUndefined();
+    expect(collectBody(conn).equals(png)).toBe(true);
+  });
+
+  it('压缩路径背压：sendData false 暂停，drain 后完整送达（解码验证）', async () => {
+    const up = await startTextUpstream();
+    const conn = new FakeConnection();
+    conn.failNextSend = true;
+    await runChannel(conn, up.url);
+    conn.drain();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(zlib.brotliDecompressSync(collectBody(conn)).toString()).toBe(BIG_TEXT);
   });
 });

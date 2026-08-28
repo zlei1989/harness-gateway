@@ -6,6 +6,7 @@
 - 修订：2026-08-21 第二轮——补充多客户端路由配套：hostname/token/defaultPath 三属性、hello 握手帧、默认鉴权、`/__gateway__/auth-check` 短路。
 - 修订：2026-08-21 第三轮（设计评审修订）——`channel.close` 改双向；4409 定为进程级错误不重连；空体强制 `http.body.end` 收尾；headers 编码 `string | string[]`；`X-Forwarded-For` 注入与 `req.ip` 语义；`connect()` 首连重试 + `connectTimeoutMs`；`close()` 先关隧道再中止在途；token 流经隧道的安全提示；子协议回选校验。
 - 修订：2026-08-24——隧道身份改为服务端分配的 **tunnelId（uuid）**：`hello.ack` 携带 tunnelId，客户端进程内存记住并在重连时经 `hello` 回带，服务端空闲即复用（浏览器会话随之恢复）；hostname 降为纯展示名、**同名并存**，4409 同名仲裁移除（客户端 4409 处理保留作旧版服务端兼容，变为不可达分支）；CLI 就绪日志打印 tunnelId 供拼 `select?tunnelId=` 深链。
+- 修订：2026-08-28 第二轮——**压缩传输**：`ClientOptions.compress`（默认关）为 upstream 未压缩的可压缩响应代做 br/gzip 端到端压缩，一次压缩覆盖 client→server→browser 两段链路（§5.1）。
 
 ## 1. 背景与目标
 
@@ -84,6 +85,7 @@ const client = new Client({
   // heartbeatIntervalMs: 30000
   // authTimeoutMs: 30000
   // connectTimeoutMs: 60000
+  // compress: false —— 压缩传输：为 upstream 未压缩的可压缩响应代做 br/gzip 端到端压缩（§5.1）
   // logger: Logger
 })
 
@@ -177,6 +179,16 @@ Express 中间件风格在隧道场景的精确适配：
 ```
 
 已确认细节：**Host 头重写为 upstream 主机**（不透传浏览器原始 Host）；**Origin 头同步重写为 upstream origin**（2026-08-23 线上事故补记：浏览器 Origin 描述的是浏览器↔网关的关系，原样透传会被上游同源/反 DNS 重绑定围栏以 Origin.host ≠ Host.host 拒绝——DSH `/api/*` 一律 403；浏览器未携带 Origin 时不伪造。WS 握手浏览器同样携带 Origin，ws 通道同一规则）。**陈旧 keep-alive 连接一次性重试**（2026-08-27 线上 502 根因补记）：限流链路把请求间隔拉长到秒级后，Agent 复用的空闲 socket 可能已被 upstream 关闭（复用即 ECONNRESET/socket hang up）；幂等方法（GET/HEAD/OPTIONS/DELETE）且响应头未收到、请求体未写入时自动换新连接重试一次（带 body 的请求不重试，防重复体）。
+
+**压缩传输（compress，2026-08-28 第二轮修订）**：开启后，HTTP 通道在回传前对响应做压缩协商，满足全部条件才压缩，任一不满足即原样透传——
+
+1. 浏览器 `Accept-Encoding`（随 `http.open` 透传）支持 `br` 或 `gzip`，br 优先（质量 4：与 gzip-6 相当的速度、更高的文本压缩率）；
+2. upstream 响应未自带 `content-encoding`（已编码直接透传，浏览器原生可解 gzip/deflate/br，**不做编码转换**——转换是纯 CPU 浪费）；
+3. 有 body（排除 HEAD/204/304）且非 Range 请求（压缩会破坏字节区间语义）；
+4. `content-type` 可压缩（text/*、JSON/XML 族、SVG、wasm；SSE `text/event-stream` 显式排除——压缩会延迟事件推送）；
+5. `content-length` 缺省（流式大 body）或 ≥ 1KB（小 body 压缩无收益）。
+
+压缩时改写 `http.head`：置 `content-encoding`、删 `content-length`（长度已变，服务端回写时由 Node 自动退化 chunked）、`Vary` 并入 `accept-encoding`；响应体经 `zlib` Brotli/Gzip 变换流后再切数据帧，`pipe` 天然串联背压（压缩流写满自动反压 upstream）。服务端对 body 与端到端头完全透明，压缩一次即覆盖 client→server→browser 两段链路；与隧道 `--tunnel-permessage-deflate` 不冲突但语义重复，开启 compress 后无需再开隧道帧压缩。
 
 ### 5.2 WS 通道
 

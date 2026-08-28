@@ -92,6 +92,10 @@ function RemoteAccessSection(): React.ReactNode {
   const gatewayState = React.useState('');
   const gateway = gatewayState[0];
   const setGateway = gatewayState[1];
+  // 压缩传输开关：默认开（host 侧配置缺省值同为 true）
+  const compressState = React.useState(true);
+  const compress = compressState[0];
+  const setCompress = compressState[1];
   const envHostState = React.useState('');
   const envHostname = envHostState[0];
   const setEnvHostname = envHostState[1];
@@ -123,6 +127,7 @@ function RemoteAccessSection(): React.ReactNode {
         setHostname(res.config.hostname);
         setToken(res.config.token);
         setGateway(res.config.gateway);
+        setCompress(res.config.compress);
         setEnvHostname(res.envHostname);
         if (res.warning) setWarning(res.warning);
         if (res.connection.state !== 'off') {
@@ -162,9 +167,9 @@ function RemoteAccessSection(): React.ReactNode {
     };
   }, [enabled]);
 
-  /** 失焦保存（三个字段一起提交，host 侧缺省回落已保存值）。 */
+  /** 失焦保存（四个字段一起提交，host 侧缺省回落已保存值）。 */
   const saveField = (): void => {
-    hostCall('remote-save-config', { hostname, token, gateway })
+    hostCall('remote-save-config', { hostname, token, gateway, compress })
       .then((raw) => {
         const res = raw as unknown as RemoteInvokeResult;
         setError(res.ok ? '' : (res.error ?? '保存失败'));
@@ -184,6 +189,23 @@ function RemoteAccessSection(): React.ReactNode {
       });
   };
 
+  /** 压缩开关切换：立即保存（无失焦时机可依赖），已连接时提示下次启用生效。 */
+  const onCompressToggle = (next: boolean): void => {
+    setCompress(next);
+    setSavedHint('');
+    hostCall('remote-save-config', { hostname, token, gateway, compress: next })
+      .then((raw) => {
+        const res = raw as unknown as RemoteInvokeResult;
+        setError(res.ok ? '' : (res.error ?? '保存失败'));
+        setSavedHint(
+          res.ok && enabled && conn.state === 'connected' ? '已保存。修改将在下次启用时生效' : '',
+        );
+      })
+      .catch((err) => {
+        setError('保存失败：' + String((err as Error)?.message ?? err));
+      });
+  };
+
   /** 开关切换：开 = remote-enable（携带当前表单值，未失焦的编辑也生效）。 */
   const onToggle = (next: boolean): void => {
     setEnabled(next);
@@ -191,7 +213,7 @@ function RemoteAccessSection(): React.ReactNode {
     setSavedHint(''); // 切换开关后旧的保存提示不再适用
     if (next) {
       setConn({ state: 'connecting' });
-      hostCall('remote-enable', { hostname, token, gateway })
+      hostCall('remote-enable', { hostname, token, gateway, compress })
         .then((raw) => {
           const res = raw as unknown as RemoteInvokeResult;
           if (!res.ok) {
@@ -267,7 +289,7 @@ function RemoteAccessSection(): React.ReactNode {
               const next = randomToken(8);
               setToken(next);
               // 生成后立即保存（不等失焦）；已连接时同样提示下次启用时生效
-              hostCall('remote-save-config', { hostname, token: next, gateway })
+              hostCall('remote-save-config', { hostname, token: next, gateway, compress })
                 .then((raw) => {
                   const res = raw as unknown as RemoteInvokeResult;
                   setSavedHint(
@@ -296,6 +318,19 @@ function RemoteAccessSection(): React.ReactNode {
         onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => setGateway(e.target.value),
         onBlur: saveField,
       }),
+    ),
+    el(
+      'div',
+      { style: S.switchRow },
+      el('input', {
+        id: 'dsh-ra-compress',
+        type: 'checkbox',
+        role: 'switch',
+        checked: compress,
+        onChange: (e: React.ChangeEvent<HTMLInputElement>) => onCompressToggle(e.target.checked),
+      }),
+      el('label', { style: S.label, htmlFor: 'dsh-ra-compress' }, '压缩传输'),
+      el('span', { style: S.hint }, '大文本响应（日志等）经 br/gzip 压缩传输，减少流量'),
     ),
     el(
       'div',

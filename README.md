@@ -58,6 +58,9 @@ export default {
   hostname: 'pc-a',                      // 选择页展示名与路由标识，全网关内唯一
   token: 'secret-token',                 // 可选：本机接入令牌，配置后用户须输入该 token
   defaultPath: '/',                      // 可选：选择成功后浏览器跳转路径，默认 '/'
+  compress: true,                        // 可选：压缩传输（默认 false），为 upstream 未压缩的
+                                         // 可压缩响应代做 br/gzip 端到端压缩；大文本日志传输量
+                                         // 可降一个数量级；SSE/Range/已编码/小响应自动透传
 }
 ```
 

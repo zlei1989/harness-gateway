@@ -10,6 +10,8 @@ export interface RemoteAccessConfigDto {
   token: string;
   /** 网关地址（裸域名缺省 http/ws；支持 http/https/ws/wss 前缀） */
   gateway: string;
+  /** 压缩传输（br/gzip 端到端压缩，默认开） */
+  compress: boolean;
 }
 
 /** 隧道连接状态。 */
