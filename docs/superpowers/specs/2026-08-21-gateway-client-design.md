@@ -95,6 +95,12 @@ await client.close()    // 优雅关闭
 client.tunnelId         // 服务端分配的隧道标识（hello.ack 后可用；重连经 hello 回带复用）
 ```
 
+> `defaultPath` 允许携带 query。dsh-remote-access 插件用它携带 DSH web 的进程级启动令牌
+> （`/?token=…`）：浏览器登录成功后落在该路径上，经隧道自动完成 DSH 浏览器认证的令牌交换
+> （铸发 dsh-auth cookie），免手工拼 loopback token URL。§4.1 hello「不含 token」指网关接入
+> 令牌；defaultPath 中的启动令牌只在隧道帧与登录响应（JSON redirect）中流转，服务端不进日志、
+> 不渲染进选择页 HTML（2026-08-29 补记）。
+
 ### 3.1 authorization 执行语义
 
 Express 中间件风格在隧道场景的精确适配：

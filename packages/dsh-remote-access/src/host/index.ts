@@ -7,6 +7,12 @@
  * 本进程内启动 gateway-client 隧道客户端，把当前 DSH web 服务
  * （upstreamUrl = http://127.0.0.1:<webServer.port>）接入网关。
  *
+ * DSH 浏览器认证桥接：隧道客户端的 defaultPath 经 connection 服务取
+ * authenticatedUrl 拼成 '/?token=…'——网关选择页登录成功后浏览器落在
+ * 带启动令牌的路径上，经隧道铸发 dsh-auth cookie，免手工拼 token URL。
+ * connection 不进模块级 inject：硬门控会让缺失该服务的老 DSH 把插件整体
+ * 挂起（远程访问全灭），运行时现取则只损失桥接便利、降级回手工流程。
+ *
  * 模块级 inject 是唯一门控：Cordis 保持此插件 PENDING 直到 webServer
  * 激活。切勿 export default（Loader 的 unwrapExports 会坍缩模块丢弃 inject）。
  */
@@ -15,14 +21,15 @@ import os from 'node:os';
 
 
 import { ConnectionManager } from './connection-manager';
+import { dshAuthDefaultPathFrom } from './gateway-url';
 import { createHandlers } from './handlers';
 
-import type { WebRequestLike, WebResponseLike, WebServerFace } from './services';
+import type { ConnectionFace, WebRequestLike, WebResponseLike, WebServerFace } from './services';
 import type { Context } from '@deepseek-ai/cordis';
 
 export const name = 'dsh-remote-access';
 
-/** 必需服务：webServer（HTTP 路由 + 当前 DSH web 端口）。 */
+/** 必需服务：webServer（HTTP 路由 + 当前 DSH web 端口）；connection 运行时现取（缺席降级，见文件头）。 */
 export const inject = ['webServer'];
 
 const LOG_PREFIX = '[dsh-remote-access]';
@@ -46,7 +53,21 @@ export function apply(ctx: Context): void {
     logError('webServer.port 不可用，远程访问插件无法确定 upstreamUrl，插件停用');
     return;
   }
-  const manager = new ConnectionManager({ upstreamUrl: `http://127.0.0.1:${port}` });
+  const upstreamUrl = `http://127.0.0.1:${port}`;
+  /**
+   * DSH 浏览器认证桥接的落地路径：每次 enable 运行时现取 connection 服务与启动令牌
+   * （令牌随 dsh web 进程轮换，不得缓存）。服务缺席/异常时 WARN 并回落 '/'——
+   * 网关登录照旧，DSH 侧退回手工拼 token URL 的老路。
+   */
+  const defaultPath = (): string => {
+    const bridged = dshAuthDefaultPathFrom(ctx.get('connection') as ConnectionFace | undefined, upstreamUrl);
+    if (bridged === undefined) {
+      logWarn('DSH 启动令牌不可用，defaultPath 回落 /（浏览器认证退回手工拼 token URL）');
+      return '/';
+    }
+    return bridged;
+  };
+  const manager = new ConnectionManager({ upstreamUrl, defaultPath });
   const handlers = createHandlers({ homeDir: os.homedir(), manager, envHostname: os.hostname() });
 
   const writeJson = (res: WebResponseLike, status: number, body: unknown): void => {

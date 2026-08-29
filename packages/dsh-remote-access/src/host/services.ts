@@ -26,3 +26,9 @@ export interface WebServerFace {
   register(route: WebRouteLike): () => void;
   port?: number;
 }
+
+/** harness connection 服务（ctx.connection）——HostConnectionHandle 中本插件消费的最小面。 */
+export interface ConnectionFace {
+  /** 给干净的 Web 应用 origin 附加本进程启动令牌（返回 .../?token=… 的启动 URL）。 */
+  authenticatedUrl(baseUrl: string): string;
+}

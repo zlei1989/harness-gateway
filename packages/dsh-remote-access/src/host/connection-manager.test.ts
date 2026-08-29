@@ -121,6 +121,29 @@ describe('ConnectionManager', () => {
     expect(capturedClientOptions[1]?.connections).toBeUndefined();
   });
 
+  it('enable 将 deps.defaultPath() 的返回值透传给 gateway-client 构造参数（缺省不传，Client 回落「/」）', async () => {
+    capturedClientOptions.length = 0;
+    // beforeEach 的 manager 未配 defaultPath 回调 → 构造参数中不得携带（Client 内 defaultPath ?? '/' 接管）
+    await manager.enable(cfg(gateway.url));
+    // 浏览器认证桥接：配置回调后每次 enable 现取——两次 enable 返回不同值（模拟令牌轮换），
+    // 两次构造参数必须各自带走当次值，证明不缓存
+    let rotation = 0;
+    const bridging = new ConnectionManager({
+      upstreamUrl: 'http://127.0.0.1:1',
+      defaultPath: () => `/?token=launch-tok-${String(++rotation)}`,
+    });
+    try {
+      await bridging.enable(cfg(gateway.url));
+      await bridging.enable(cfg(gateway.url)); // enable 幂等：关旧建新，第二次现取
+    } finally {
+      await bridging.disable();
+    }
+    expect(rotation).toBe(2);
+    expect(capturedClientOptions[0]?.defaultPath).toBeUndefined();
+    expect(capturedClientOptions[1]).toMatchObject({ defaultPath: '/?token=launch-tok-1' });
+    expect(capturedClientOptions[2]).toMatchObject({ defaultPath: '/?token=launch-tok-2' });
+  });
+
   it('非法网关地址：enable 抛错，状态保持 off', async () => {    await expect(manager.enable(cfg(''))).rejects.toThrow(/不能为空/);
     expect(manager.status.state).toBe('off');
   });

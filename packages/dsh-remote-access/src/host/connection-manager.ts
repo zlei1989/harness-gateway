@@ -22,6 +22,12 @@ import type { ConnectionStatusDto } from '../shared/types';
 export interface ConnectionManagerDeps {
   /** 当前 DSH web 服务地址（http://127.0.0.1:<webServer.port>） */
   upstreamUrl: string;
+  /**
+   * 网关选择成功后浏览器落地路径（网关客户端 defaultPath），每次 enable 现取——
+   * DSH 浏览器认证桥接要求它携带进程级启动令牌（'/?token=…'），令牌随 dsh web
+   * 重启轮换，不得缓存。缺省不传，Client 内 defaultPath ?? '/' 接管。
+   */
+  defaultPath?: () => string;
 }
 
 const LOG_PREFIX = '[dsh-remote-access]';
@@ -59,6 +65,9 @@ export class ConnectionManager {
         hostname,
         token: cfg.token,
         compress: cfg.compress,
+        // DSH 浏览器认证桥接：落地路径携带启动令牌（每次 enable 现取，令牌随进程轮换）；
+        // 缺省传 undefined，Client 默认 '/'（与下方 connections 同一透传模式）
+        defaultPath: this.deps.defaultPath?.(),
         // 隧道连接数原样透传：undefined 时 Client 默认 4（spec §8）
         connections: cfg.connections,
         logger: createPluginLogger(),
