@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * dist 部署入口 — esbuild 单文件打包专用（scripts/build.mjs → dist/index.js）。
+ * dist 部署入口 — esbuild 单文件打包专用（scripts/build.mjs → dist/index.cjs）。
  * 与 cli.ts 的区别：面向「拷贝单文件到目标机直接 node 运行」的部署场景，
  * 不支持 CLI 参数，端口只读环境变量 HARNESS_GATEWAY_PORT（未设置/非法 → 9000）。
  * 安全红线同 cli.ts：错误只输出单行诊断（err.message 首行），不打印原始堆栈/代码帧。
