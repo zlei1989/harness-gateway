@@ -2,7 +2,11 @@
  * 浏览器 HTTP ↔ 隧道通道桥接（spec §7.1）。
  * headers 三处加工：①注入 Authorization: Bearer（覆盖浏览器原值）②剥离 gateway_sid ③注入/追加 X-Forwarded-For。
  * 注意：等 http.head 有 headTimeoutMs 超时；收到 head 后不再设总超时（SSE/流式）；
- * 浏览器中途断开 → channel.close 取消通道；隧道断开 → 在途通道 502。
+ * 浏览器中途断开 → channel.close 取消通道。
+ * 隧道断开 → 在途通道两条路（线上移动端超时降级）：
+ * ① head 未下发且无请求体的幂等方法（GET/HEAD/OPTIONS）→ 宽限内挂起等重连、在新隧道上
+ *   原样重放（每请求至多一次，浏览器仅感知慢响应而非 502）；
+ * ② 其余（已流式/带 body/非幂等/重放后再断/宽限耗尽）→ 保持原 502 语义——已发字节无法撤回。
  * CORS 允许名单：预检短路 204；响应反射命中名单的 Origin，上游 access-control-* 一律清除。
  */
 
@@ -11,7 +15,7 @@ import { type ControlFrame, type DataHeader, type HeadersJson, normalizeHeaders,
 import { safePathname } from './url';
 
 import type { Logger } from './logger';
-import type { PendingChannel, TunnelRegistry } from './session';
+import type { PendingChannel, TunnelRegistry, TunnelSession } from './session';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 export interface ProxyContext {
@@ -137,15 +141,30 @@ export async function handleBrowserHttp(
   let headAt: number | null = null;
   let bodyBytes = 0;
   let finalStatus: number | string | null = null;
+  /** 浏览器侧请求体已收尾（空体规则：GET 也在入口即发 end）：重放开新通道时须补发空载 http.body.end */
+  let bodyEnded = false;
+  /**
+   * 幂等重放面（线上移动端超时降级）：仅"无请求体的幂等方法"可重放——带 body 的请求体重放有
+   * 重复/丢失风险；head 已下发的响应无法撤回已发字节（在 onTunnelDown 按 headAt 判定）。
+   * 每请求至多重放一次：连杀风暴由 502 兜底，防无限挂起。
+   */
+  const replayable = ['GET', 'HEAD', 'OPTIONS'].includes((req.method ?? 'GET').toUpperCase())
+    && req.headers['content-length'] === undefined
+    && req.headers['transfer-encoding'] === undefined;
+  let replayed = false;
+  /** 重放等待中标志：此期间 res 'close' 的 browser-aborted 常规路径让位给重放的 browserGone 竞速 */
+  let replaying = false;
+  /** 当前活跃通道（重放换代后指向新隧道的通道）；req/res 事件回调经它路由 */
+  let active: { tunnel: TunnelSession; channelId: number } | null = null;
   const finish = (fn: () => void): void => {
     if (finished) return;
     finished = true;
     if (headTimer) clearTimeout(headTimer);
-    tunnel.unregister(channelId);
+    active?.tunnel.unregister(active.channelId);
     fn();
     // 完成计时日志：url 只记 pathname（查询串是常见 token 携带位）；bodyBytes 供带宽归因
     ctx.logger.info('请求完成', {
-      channelId,
+      channelId: active?.channelId,
       method: req.method,
       url: safePathname(req.url) ?? '/',
       status: finalStatus,
@@ -156,39 +175,121 @@ export async function handleBrowserHttp(
     });
   };
 
-  const channel: PendingChannel = {
-    kind: 'http',
-    onControl: (frame: ControlFrame) => {
-      if (frame.type === 'http.head') {
-        finishHeaders(frame.status, frame.headers);
-      } else if (frame.type === 'channel.error') {
-        ctx.logger.error('通道级错误（客户端回报）', { channelId, message: frame.message });
-        finalStatus = 502;
-        finish(() => {
-          if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', ...cors });
-          res.end();
-        });
-      } else if (frame.type === 'channel.close') {
-        finish(() => res.end());
+  /** 502 终态（隧道断/通道级错误/重放耗尽的公共落点） */
+  const finish502 = (): void => {
+    finalStatus = 502;
+    finish(() => {
+      if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', ...cors });
+      res.end();
+    });
+  };
+
+  /** 隧道断开时的在途通道处置：重放面内挂起等重连，面外保持原 502 语义 */
+  const onActiveTunnelDown = (): void => {
+    // 重放面外条件：已重放过 / 非重放面 / 无宽限 / head 已下发 / 浏览器已走
+    const noReplay = replayed || !replayable || ctx.tunnelRestoreGraceMs <= 0
+      || headAt !== null || res.destroyed;
+    if (noReplay) {
+      finish502();
+      return;
+    }
+    replayed = true;
+    replaying = true;
+    if (headTimer) { clearTimeout(headTimer); headTimer = null; } // 重放等待由宽限时钟接管
+    ctx.logger.info('隧道断开，幂等请求挂起待重放', {
+      channelId: active?.channelId,
+      method: req.method,
+      url: safePathname(req.url) ?? '/',
+      graceMs: ctx.tunnelRestoreGraceMs,
+      hostname: session.hostname,
+    });
+    // 必须推迟到 teardown 同步段完成后再 waitFor：onTunnelDown 在 session.teardown 的通道循环里
+    // 同步触发，此刻注册表仍持有将死会话、leg 尚未关闭——立即 waitFor 会瞬时 resolve 到旧会话，
+    // 重放通道登记在尸体上（实测：重放 1ms 后"恢复"、head 永远不到、headTimeout 504）
+    setImmediate(() => { void replayUntilRestore(); });
+  };
+
+  /** 重放等待：隧道恢复与浏览器断开竞速；恢复则新隧道上换代重开通道，耗尽/浏览器先走按对应终态收尾 */
+  const replayUntilRestore = async (): Promise<void> => {
+    const browserGone = new Promise<null>((resolve) => res.once('close', () => resolve(null)));
+    const restored = await Promise.race([
+      ctx.tunnels.waitFor(session.tunnelId, ctx.tunnelRestoreGraceMs),
+      browserGone,
+    ]);
+    replaying = false;
+    if (finished) return; // 等待期间被并行路径终结（防御）
+    if (restored === null) {
+      // 浏览器已走：无人收货，静默终结（不写 502）；宽限耗尽：浏览器还在等 → 502
+      if (res.destroyed || res.writableEnded) {
+        finalStatus = 'browser-aborted';
+        finish(() => undefined);
+        return;
       }
-    },
-    onData: (header: DataHeader, payload: Buffer) => {
-      if (header.kind === 'http.body') {
-        bodyBytes += payload.length;
-        if (!res.write(payload)) {
-          // 浏览器侧写缓冲背压：暂停读取由整体 WS bufferedAmount 兜底（v1 不做逐通道背压，spec §4.3）
+      finish502();
+      return;
+    }
+    try {
+      openChannel(restored, true);
+    } catch {
+      // 恢复瞬间再断的竞态（waitFor resolve 与 teardown 之间）：重放额度已用尽，落原 502 语义
+      finish502();
+    }
+  };
+
+  /** 在给定隧道上登记通道并下发 http.open（重放换代复用）；headTimer 随每次开通道重装 */
+  const openChannel = (t: TunnelSession, isReplay: boolean): void => {
+    const channel: PendingChannel = {
+      kind: 'http',
+      onControl: (frame: ControlFrame) => {
+        if (frame.type === 'http.head') {
+          finishHeaders(frame.status, frame.headers);
+        } else if (frame.type === 'channel.error') {
+          ctx.logger.error('通道级错误（客户端回报）', { channelId: active?.channelId, message: frame.message });
+          finish502();
+        } else if (frame.type === 'channel.close') {
+          finish(() => res.end());
         }
-      } else if (header.kind === 'http.body.end') {
-        finish(() => res.end());
-      }
-    },
-    onTunnelDown: () => {
-      finalStatus = 502;
+      },
+      onData: (header: DataHeader, payload: Buffer) => {
+        if (header.kind === 'http.body') {
+          bodyBytes += payload.length;
+          if (!res.write(payload)) {
+            // 浏览器侧写缓冲背压：暂停读取由整体 WS bufferedAmount 兜底（v1 不做逐通道背压，spec §4.3）
+          }
+        } else if (header.kind === 'http.body.end') {
+          finish(() => res.end());
+        }
+      },
+      onTunnelDown: () => onActiveTunnelDown(),
+    };
+    const channelId = t.register(channel);
+    active = { tunnel: t, channelId };
+    t.sendControl({
+      type: 'http.open',
+      channelId,
+      method: req.method ?? 'GET',
+      url: req.url ?? '/',
+      headers: prepareForwardHeaders(req, session.token),
+    });
+    // 重放换代：浏览器请求体早已收尾（重放面 = 无体请求），补发空载 body.end 让客户端能 end upstream 请求
+    if (isReplay && bodyEnded) t.sendData({ channelId, kind: 'http.body.end' }, Buffer.alloc(0));
+    // 日志只记 pathname：查询串是常见 token 携带位，任何级别不得打印完整 req.url（转发帧仍带完整 url）
+    if (isReplay) {
+      ctx.logger.info('隧道已恢复，重放幂等请求', { channelId, method: req.method, url: safePathname(req.url) ?? '/', hostname: session.hostname });
+    } else {
+      ctx.logger.info('请求入口', { channelId, method: req.method, url: safePathname(req.url) ?? '/', hostname: session.hostname });
+    }
+    // 等 http.head 超时（收到 head 后不再设总超时，支持 SSE）
+    if (headTimer) clearTimeout(headTimer);
+    headTimer = setTimeout(() => {
+      ctx.logger.warn('等 http.head 超时', { channelId });
+      finalStatus = 504;
       finish(() => {
-        if (!res.headersSent) res.writeHead(502, { 'content-type': 'text/plain; charset=utf-8', ...cors });
-        res.end();
+        t.sendControl({ type: 'channel.close', channelId, reason: 'head timeout' });
+        if (!res.headersSent) res.writeHead(504, { 'content-type': 'text/plain; charset=utf-8', ...cors });
+        res.end('gateway timeout');
       });
-    },
+    }, ctx.headTimeoutMs);
   };
 
   const finishHeaders = (status: number, headers: HeadersJson): void => {
@@ -204,17 +305,7 @@ export async function handleBrowserHttp(
     res.flushHeaders();
   };
 
-  const channelId = tunnel.register(channel);
-
-  tunnel.sendControl({
-    type: 'http.open',
-    channelId,
-    method: req.method ?? 'GET',
-    url: req.url ?? '/',
-    headers: prepareForwardHeaders(req, session.token),
-  });
-  // 日志只记 pathname：查询串是常见 token 携带位，任何级别不得打印完整 req.url（转发帧仍带完整 url）
-  ctx.logger.info('请求入口', { channelId, method: req.method, url: safePathname(req.url) ?? '/', hostname: session.hostname });
+  openChannel(tunnel, false);
 
   // 请求体流式透传；空体规则：end 事件必发空载 http.body.end。
   // 聚合背压（对称 ws-proxy 与客户端 http-channel，线上断连根因修复）：sendData 超聚合高水位
@@ -223,34 +314,29 @@ export async function handleBrowserHttp(
   // 无需 exceedsMaxDataFrame 护栏：chunk 来自 Node 流读取（≪100MiB），数学上不可能超隧道帧上限；
   // encodeData 的 PayloadTooLargeError 兜底防协议失配（WS 消息路径尺寸不受控，护栏在 ws-proxy）
   req.on('data', (chunk: Buffer) => {
-    if (finished) return;
-    if (!tunnel.sendData({ channelId, kind: 'http.body' }, chunk)) {
+    if (finished || active === null) return;
+    const cur = active;
+    if (!cur.tunnel.sendData({ channelId: cur.channelId, kind: 'http.body' }, chunk)) {
       req.pause();
-      void tunnel.waitDrain().then(() => { if (!finished) req.resume(); });
+      void cur.tunnel.waitDrain().then(() => { if (!finished) req.resume(); });
     }
   });
   req.on('end', () => {
-    if (!finished) tunnel.sendData({ channelId, kind: 'http.body.end' }, Buffer.alloc(0));
+    bodyEnded = true; // 重放换代时据此补发空载 body.end
+    if (!finished && active !== null) {
+      active.tunnel.sendData({ channelId: active.channelId, kind: 'http.body.end' }, Buffer.alloc(0));
+    }
   });
 
   // 浏览器中途断开 → 取消通道。
   // 注意：必须挂在 res 上——Node ≥16 起 req(IncomingMessage) 在请求正常收完后也会发 'close'，
-  // 挂 req 会把每个完整请求误判为中止；res 的 'close' 仍只表示底层连接关闭，writableEnded 区分正常结束
+  // 挂 req 会把每个完整请求误判为中止；res 的 'close' 仍只表示底层连接关闭，writableEnded 区分正常结束。
+  // 重放等待期（replaying）此处让位：浏览器断开由 replayUntilRestore 的 browserGone 竞速接管，
+  // 避免向已死隧道补发 channel.close（ws 已 CLOSED，send 会抛错）
   res.on('close', () => {
-    if (!finished && !res.writableEnded) {
+    if (!finished && !res.writableEnded && !replaying) {
       finalStatus = 'browser-aborted';
-      finish(() => tunnel.sendControl({ type: 'channel.close', channelId, reason: 'browser aborted' }));
+      finish(() => active?.tunnel.sendControl({ type: 'channel.close', channelId: active.channelId, reason: 'browser aborted' }));
     }
   });
-
-  // 等 http.head 超时（收到 head 后不再设总超时，支持 SSE）
-  headTimer = setTimeout(() => {
-    ctx.logger.warn('等 http.head 超时', { channelId });
-    finalStatus = 504;
-    finish(() => {
-      tunnel.sendControl({ type: 'channel.close', channelId, reason: 'head timeout' });
-      if (!res.headersSent) res.writeHead(504, { 'content-type': 'text/plain; charset=utf-8', ...cors });
-      res.end('gateway timeout');
-    });
-  }, ctx.headTimeoutMs);
 }
