@@ -22,6 +22,11 @@ export interface RemoteAccessConfig {
   compress: boolean;
   /** 隧道连接数（可选；默认 4，1=单连接 legacy 模式，详见网关 README） */
   connections?: number;
+  /**
+   * 隧道心跳间隔毫秒（可选；默认 30000）。前置反代/负载均衡的空闲超时短于 30s 时
+   * 必须调小到其一半以下，否则隧道被周期性回收（表现：规律性断连重连，详见网关 README）
+   */
+  heartbeatIntervalMs?: number;
 }
 
 export const DEFAULT_GATEWAY = 'harness-gateway.7qbjs.com';
@@ -55,6 +60,10 @@ export function loadConfig(homeDir: string): RemoteAccessConfig {
     compress: typeof raw.compress === 'boolean' ? raw.compress : true,
     // 可选字段：仅在 yaml 手工配置时透传（不落盘补全，缺省由 gateway-client 默认 4 接管）
     connections: typeof raw.connections === 'number' ? raw.connections : undefined,
+    // 同上：非法值（非正有限数）视为未配置，由 gateway-client 默认 30s 接管
+    heartbeatIntervalMs: typeof raw.heartbeatIntervalMs === 'number'
+      && Number.isFinite(raw.heartbeatIntervalMs) && raw.heartbeatIntervalMs > 0
+      ? raw.heartbeatIntervalMs : undefined,
   };
   // 补全了缺省字段则落盘（token 等默认值生成一次后稳定）
   if (cfg.hostname !== raw.hostname || cfg.token !== raw.token || cfg.gateway !== raw.gateway

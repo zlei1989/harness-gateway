@@ -70,6 +70,8 @@ export class ConnectionManager {
         defaultPath: this.deps.defaultPath?.(),
         // 隧道连接数原样透传：undefined 时 Client 默认 4（spec §8）
         connections: cfg.connections,
+        // 心跳间隔原样透传：undefined 时 Client 默认 30s（前置反代空闲超时更短时经 yaml 调小）
+        heartbeatIntervalMs: cfg.heartbeatIntervalMs,
         logger: createPluginLogger(),
       });
       this.client = client;

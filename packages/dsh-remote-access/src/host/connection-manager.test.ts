@@ -121,6 +121,14 @@ describe('ConnectionManager', () => {
     expect(capturedClientOptions[1]?.connections).toBeUndefined();
   });
 
+  it('enable 将 heartbeatIntervalMs 原样透传给 gateway-client 构造参数（缺省传 undefined，Client 默认 30s）', async () => {
+    capturedClientOptions.length = 0;
+    await manager.enable({ ...cfg(gateway.url), heartbeatIntervalMs: 10_000 });
+    await manager.enable(cfg(gateway.url));
+    expect(capturedClientOptions[0]).toMatchObject({ heartbeatIntervalMs: 10_000 });
+    expect(capturedClientOptions[1]?.heartbeatIntervalMs).toBeUndefined();
+  });
+
   it('enable 将 deps.defaultPath() 的返回值透传给 gateway-client 构造参数（缺省不传，Client 回落「/」）', async () => {
     capturedClientOptions.length = 0;
     // beforeEach 的 manager 未配 defaultPath 回调 → 构造参数中不得携带（Client 内 defaultPath ?? '/' 接管）
@@ -148,20 +156,22 @@ describe('ConnectionManager', () => {
     expect(manager.status.state).toBe('off');
   });
 
-  it('隧道被中间件非法 close 帧（1006）杀掉：回 connecting 自动重连恢复，不误落 error（线上回归）', async () => {
+  it('隧道被中间件非法 close 帧（1006）杀掉：自动重连恢复，全程不误落 error（线上回归）', async () => {
     await manager.enable(cfg(gateway.url));
     expect(manager.status.state).toBe('connected');
     gateway.sendIllegalCloseFrame();
-    // 断开回落 connecting（内建重连退避 0.5-1s，窗口足够 waitFor 捕获）。
-    // 旧行为：瞬时 ws error 直接落 error 终态且 disconnected 不降级，
-    // UI 卡「连接失败：Invalid WebSocket frame: invalid status code 1006」直至重连成功
-    await vi.waitFor(() => expect(manager.status.state).toBe('connecting'), { timeout: 2000 });
-    expect(manager.status.state).not.toBe('error');
-    // 内建重连自动恢复，deepLink/tunnelId 随之回来
-    await vi.waitFor(() => {
-      expect(manager.status.state).toBe('connected');
-      expect(manager.status.tunnelId).toBe('tid-test-1');
-    }, { timeout: 10000 });
+    // 旧断言依赖"退避 0.5-1s 期间可观测到 connecting"；已就绪会话被杀后首次重连立即发起
+    // （客户端重连提速）后 connecting 窗口缩到 RTT 级，轮询不可保证采到——回归的实质是
+    // "瞬时 ws error 不误落 error 终态 + 自动恢复"，改为快速采样全程状态验证从未落 error
+    const observed: string[] = [];
+    const deadline = Date.now() + 3000;
+    while (manager.status.state !== 'connected' && Date.now() < deadline) {
+      observed.push(manager.status.state);
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    expect(manager.status.state).toBe('connected');
+    expect(manager.status.tunnelId).toBe('tid-test-1'); // 重连 hello 回带复用，会话无损
+    expect(observed).not.toContain('error');
   });
 
   it('连接失败（网关不可达）：状态进入 error 而非悬挂', async () => {

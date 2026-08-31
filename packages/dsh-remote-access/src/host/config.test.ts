@@ -46,6 +46,25 @@ describe('loadConfig', () => {
     writeFileSync(path, ': : : not yaml [', 'utf8');
     expect(() => loadConfig(home)).toThrow();
   });
+
+  it('可选字段 heartbeatIntervalMs：手工配置才透传，非法值视为未配置，未配置不落盘补全', () => {
+    const path = configPath(home);
+    // 先 saveConfig 建目录（与既有用例同）；再覆写为"四字段齐备"的基线，隔离补全落盘副作用
+    saveConfig(home, { hostname: 'pc-a', token: 'tok12345', gateway: 'gw.example.com', compress: true });
+    const base = 'hostname: pc-a\ntoken: tok12345\ngateway: gw.example.com\ncompress: true\n';
+    // 未配置 → undefined 且文件不被改写（可选字段不参与补全落盘）
+    writeFileSync(path, base, 'utf8');
+    expect(loadConfig(home).heartbeatIntervalMs).toBeUndefined();
+    expect(readFileSync(path, 'utf8')).toBe(base);
+    // 手工配置合法值 → 透传
+    writeFileSync(path, `${base}heartbeatIntervalMs: 10000\n`, 'utf8');
+    expect(loadConfig(home).heartbeatIntervalMs).toBe(10000);
+    // 非法值（零/负数/非数字）→ 视为未配置
+    for (const bad of ['0', '-5', 'abc']) {
+      writeFileSync(path, `${base}heartbeatIntervalMs: ${bad}\n`, 'utf8');
+      expect(loadConfig(home).heartbeatIntervalMs).toBeUndefined();
+    }
+  });
 });
 
 describe('saveConfig', () => {
