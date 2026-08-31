@@ -245,6 +245,24 @@ describe('Connection', () => {
     await gw.close();
   });
 
+  it('已就绪会话被杀后首次重连立即发起（不进退避，用户可见断窗压到 RTT 级）', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    // baseDelayMs 拉大到 2000ms 制造可分辨窗口：走退避的旧行为下第二次 hello ≥1s 后才到
+    const conn = new Connection({
+      gatewayUrl: gw.url, ...OPTS,
+      reconnect: { baseDelayMs: 2000, maxDelayMs: 8000, maxRetries: Infinity },
+    }, handlers);
+    conn.on('error', () => {});
+    await conn.connect();
+    gw.dropAll(); // 已就绪会话被杀（中间盒杀连接/瞬断场景：连接刚刚还健康，立即重试是安全的）
+    await vi.waitFor(() => {
+      expect(gw.received.filter((f) => f.type === 'hello')).toHaveLength(2);
+    }, { timeout: 800, interval: 20 }); // 远小于 baseDelayMs=2000 的窗口内必须到达
+    await conn.close();
+    await gw.close();
+  });
+
   // 726a481 回归锁（原唯一回归锁是 server 包 e2e S12）：定时器触发即清引用，
   // 字段语义为"待触发的重连定时器"；触发后残留引用会让稳态不变量失真（S12 重连风暴场景暴露）
   it('重连定时器触发后清引用：断线重连成功后 reconnectTimer 为 null', async () => {
@@ -551,11 +569,15 @@ describe('Connection', () => {
 describe('tunnel.ack 端到端流量窗口', () => {
   /** 造 3MiB 数据帧把在途量顶过 2MiB 高窗口（单帧 < 100MiB 上限） */
   const bigPayload = (): Buffer => Buffer.alloc(3 * 1024 * 1024);
+  // 心跳放宽到 10s（判死窗 30s）：本组用例的多步 50-300ms 观察窗与流量窗口状态强绑定，
+  // 全量回归负载下 OPTS 的 60ms 心跳（180ms 判死）会误判死重连，重连把 flowAckActive/在途量
+  // 归零，waitDrain 假唤醒（实测全量偶发：drained 提前为 true）。与下方判死专测同口径
+  const WINDOW_OPTS = { ...OPTS, heartbeatIntervalMs: 10_000 };
 
   it('收到 tunnel.ack 前（老服务端）：sendData 不受流量窗口限制，ack 帧不上抛通道层', async () => {
     const gw = new MockGateway();
     const { handlers, calls } = makeHandlers();
-    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
+    const conn = new Connection({ gatewayUrl: gw.url, ...WINDOW_OPTS }, handlers);
     conn.on('error', () => {});
     await conn.connect();
     // 老服务端不回 ack：3MiB 在途也不触发流量窗口（仅本地水位生效，localhost 下不触发）
@@ -570,12 +592,16 @@ describe('tunnel.ack 端到端流量窗口', () => {
   it('激活后在途量超窗口 → sendData 返回 false；ack 推进到滞回线内 → waitDrain 唤醒', async () => {
     const gw = new MockGateway();
     const { handlers } = makeHandlers();
-    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS }, handlers);
+    const conn = new Connection({ gatewayUrl: gw.url, ...WINDOW_OPTS }, handlers);
     conn.on('error', () => {});
     await conn.connect();
-    // 激活流量窗口（等价服务端已回执 0 字节起步）；无速率样本时按最小窗口 256KiB
+    // 激活流量窗口（等价服务端已回执 0 字节起步）；无速率样本时按最小窗口 256KiB。
+    // 条件轮询替代固定 sleep：全量回归负载下 50ms 可被 CPU 争用击穿，ack 未处理完则
+    // flowAckActive 仍 false、sendData 不走背压分支（实测全量偶发 expected true to be false）
     gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: 0 }));
-    await new Promise((r) => setTimeout(r, 50));
+    await vi.waitFor(() => {
+      expect((conn as unknown as { flowAckActive: boolean }).flowAckActive).toBe(true);
+    });
     // 在途 3MiB > 256KiB 最小窗口 → 背压
     expect(conn.sendData({ channelId: 1, kind: 'http.body' }, bigPayload())).toBe(false);
     // ack 未推进：waitDrain 不得唤醒（轮询确认在途量仍在滞回线之上）

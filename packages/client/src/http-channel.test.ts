@@ -96,7 +96,13 @@ describe('HttpChannel', () => {
     });
     await ch.start();
     ch.onBodyEnd(); // 空体规则：无 body 也必须 end 收尾
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：全量回归并行负载下固定 50ms 等待会被 CPU 争用击穿
+    // （实测全量偶发 "expected undefined to match object { status: 200 }"）；
+    // head 未到达则轮询至 2s 上限，随后断言照旧失败——等待机制只改健壮性不改判定
+    const deadline = Date.now() + 2000;
+    while (!conn.controls.some((f) => f.type === 'http.head') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(up.hits[0]?.headers['host']).toBe(`127.0.0.1:${up.url.port}`);
     const head = conn.controls.find((f) => f.type === 'http.head');
     expect(head).toMatchObject({ status: 200 });

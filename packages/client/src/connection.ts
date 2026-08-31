@@ -456,11 +456,14 @@ export class Connection extends EventEmitter implements TunnelSender {
       }
       return;
     }
-    this.scheduleReconnect();
+    this.scheduleReconnect(wasReady);
   }
 
-  /** 退避重连：base * 2^attempts 封顶 max，加 ±50% 抖动；maxRetries 耗尽按场景 reject 或报错停止 */
-  private scheduleReconnect(): void {
+  /**
+   * 重连调度：已就绪会话被杀立即重连一次；重连尝试自身失败才按 base * 2^attempts 退避
+   * （封顶 max，±50% 抖动）；maxRetries 耗尽按场景 reject 或报错停止
+   */
+  private scheduleReconnect(wasReady: boolean): void {
     if (this.closing) return;
     if (this.attempts >= this.opts.reconnect.maxRetries) {
       const err = new Error(`reconnect exhausted after ${this.attempts} attempts`);
@@ -475,7 +478,10 @@ export class Connection extends EventEmitter implements TunnelSender {
     }
     const { baseDelayMs, maxDelayMs } = this.opts.reconnect;
     const exp = Math.min(baseDelayMs * 2 ** this.attempts, maxDelayMs);
-    const delay = exp * (0.5 + Math.random() * 0.5);
+    // 已就绪会话被杀后的首次重连立即发起（线上移动端降级）：中间盒杀连接/瞬断时连接刚刚
+    // 还健康，立即重试把用户可见断窗从 0.5-1s 压到 RTT 级；重连尝试自身失败（服务不可达）
+    // 才进入指数退避防洪——防洪针对的是"连不上"，不是"被杀"
+    const delay = wasReady ? 0 : exp * (0.5 + Math.random() * 0.5);
     this.attempts += 1;
     this.opts.logger.info('隧道重连中', { attempts: this.attempts, delayMs: Math.round(delay) });
     this.reconnectTimer = setTimeout(() => {

@@ -142,7 +142,15 @@ export class Client extends EventEmitter {
       },
     });
     this.connection.on('error', (err: Error) => {
-      this.logger.error('隧道连接错误', { error: err.stack ?? err.message });
+      // 指纹分级（线上 1006 排查）：收到携带 RFC 6455 保留码的非法 close 帧 = 帧由路径上的
+      // 中间盒/LB 合成（本仓库双端基于 ws 库，Sender 物理上拒绝发送保留码帧）——属"他杀"
+      // 确证而非本仓库故障；连接由 Connection 内建重连自动收敛，记 WARN 归因留证，
+      // 不按通用隧道故障记 ERROR 误导排查方向（现象无变化：断连重连本就由此驱动）
+      if (isSynthesizedCloseKill(err)) {
+        this.logger.warn('收到中间盒合成的非法 close 帧，隧道由内建重连恢复', { error: err.message });
+      } else {
+        this.logger.error('隧道连接错误', { error: err.stack ?? err.message });
+      }
       this.emit('error', err);
     });
     // 终态失败透传（不再重连：4409 / 重连耗尽）；瞬时 ws 错误只走 'error'，由重连收敛
@@ -288,3 +296,13 @@ export class Client extends EventEmitter {
 
 // ChannelErrorFrame 仅用于类型完备性（dispatchControl switch 内联收窄）
 export type { ChannelErrorFrame };
+
+/**
+ * 中间盒杀连接指纹：ws Receiver 解析到携带 RFC 6455 保留状态码（如 1006）的 close 帧时
+ * 抛 RangeError "Invalid WebSocket frame: invalid status code N"。保留码按规范永不上线，
+ * 且 ws 库 Sender.close() 校验拒绝发送——收到即证明帧由路径上的中间盒/LB 合成注入
+ * （服务端基于 ws，物理上不可能是发送方）。仅作日志分级判定，不改变任何连接行为。
+ */
+export function isSynthesizedCloseKill(err: Error): boolean {
+  return err instanceof RangeError && /invalid status code/i.test(err.message);
+}

@@ -35,6 +35,15 @@ class MiniGateway {
     return `ws://127.0.0.1:${addr.port}/__gateway__/tunnel`;
   }
   send(frame: ControlFrame): void { this.ws?.send(encodeControl(frame)); }
+  /**
+   * 模拟线上中间盒 synthesized 的非法 close 帧（code 1006 是 RFC 保留字，ws 库自身发不出）：
+   * 绕过 ws 直接往裸 socket 写 close 帧（FIN|opcode 0x8，2 字节负载 0x03EE=1006），
+   * 客户端 ws 收帧即抛 "Invalid WebSocket frame: invalid status code 1006"（线上报错原文）
+   */
+  sendIllegalCloseFrame(): void {
+    (this.ws as unknown as { _socket: import('node:net').Socket } | null)?._socket
+      .write(Buffer.from([0x88, 0x02, 0x03, 0xee]));
+  }
   async close(): Promise<void> {
     this.ws?.terminate();
     await new Promise<void>((r) => this.wss.close(() => r()));
@@ -87,6 +96,31 @@ describe('Client 生命周期与帧路由', () => {
     await client.connect();
     gw.send({ type: 'channel.close', channelId: 999 });
     await new Promise((r) => setTimeout(r, 30));
+    await client.close();
+    await gw.close();
+  });
+
+  it('指纹分级：中间盒非法 close 帧（1006 上线）记 WARN 归因而非 ERROR，隧道自动重连且 hello 回带 tunnelId', async () => {
+    const gw = new MiniGateway();
+    const logs: Array<{ level: string; message: string }> = [];
+    const capture = (level: string) => (message: string): void => {
+      logs.push({ level, message });
+    };
+    const client = new Client({
+      ...BASE, upstreamUrl: 'http://127.0.0.1:1', gatewayUrl: gw.url,
+      logger: { debug: capture('debug'), info: capture('info'), warn: capture('warn'), error: capture('error') },
+    });
+    client.on('error', () => {});
+    await client.connect();
+    gw.sendIllegalCloseFrame();
+    // 内建重连自动恢复：第二次 hello 回带 tunnelId 请求复用（服务端空闲即保住浏览器会话）
+    await vi.waitFor(() => {
+      expect(gw.received.filter((f) => f.type === 'hello')).toHaveLength(2);
+    }, { timeout: 5000 });
+    expect(gw.received.filter((f) => f.type === 'hello')[1]?.client.tunnelId).toBe('tid-mini-1');
+    // 指纹归因：WARN 留证、不归 ERROR；'error' 事件语义不变（监听方仍收到）
+    expect(logs.some((l) => l.level === 'warn' && l.message.includes('非法 close 帧'))).toBe(true);
+    expect(logs.some((l) => l.message === '隧道连接错误')).toBe(false);
     await client.close();
     await gw.close();
   });
