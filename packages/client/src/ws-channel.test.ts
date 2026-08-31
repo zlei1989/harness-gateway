@@ -94,7 +94,11 @@ describe('WsChannel', () => {
       onDone: () => {},
     });
     await ch.start();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!conn.controls.some((f) => f.type === 'ws.accept') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(conn.controls.find((f) => f.type === 'ws.accept')).toMatchObject({ type: 'ws.accept', protocol: 'chat' });
   });
 
@@ -111,7 +115,11 @@ describe('WsChannel', () => {
     await new Promise((r) => setTimeout(r, 50));
     ch.onMessage('text', Buffer.from('hi'));
     ch.onMessage('binary', Buffer.from([0x01, 0x02]));
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (conn.data.length < 2 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     const kinds = conn.data.map((d) => d.header.dataType);
     expect(kinds).toEqual(['text', 'binary']);
     expect(conn.data[0]?.payload.toString()).toBe('hi');
@@ -130,7 +138,11 @@ describe('WsChannel', () => {
       onDone: () => {},
     });
     await ch.start();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!conn.controls.some((f) => f.type === 'ws.accept') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(conn.controls.find((f) => f.type === 'ws.accept')).toBeDefined();
     expect(up.headers[0]?.['origin']).toBe(up.url.origin);
   });
@@ -161,7 +173,11 @@ describe('WsChannel', () => {
     const conn = new FakeConnection();
     const ch = new WsChannel({ id: 1, open: makeOpen({ protocols: ['other'] }), upstream: up.url, connection: conn.asConnection(), authorize: ALLOW, logger: nullLogger, onDone: () => {} });
     await ch.start();
-    await new Promise((r) => setTimeout(r, 100));
+    // 条件轮询替代固定 sleep：负载下固定 100ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!conn.controls.some((f) => f.type === 'ws.reject') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(conn.controls.find((f) => f.type === 'ws.reject')).toMatchObject({ status: 502 });
   });
 
@@ -175,9 +191,18 @@ describe('WsChannel', () => {
       onDone: () => {},
     });
     await ch.start();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）；
+    // 等 upstream 客户端入列 wss.clients，close 动作才有效
+    const upDeadline = Date.now() + 5000;
+    while (up.wss.clients.size === 0 && Date.now() < upDeadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     for (const ws of up.wss.clients) ws.close(1001, 'going away');
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!conn.controls.some((f) => f.type === 'channel.close') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(conn.controls.find((f) => f.type === 'channel.close')).toMatchObject({ type: 'channel.close', code: 1001 });
   });
 
@@ -192,7 +217,11 @@ describe('WsChannel', () => {
     });
     void ch.start(); // 不等待：模拟消息先于 accept 到达
     ch.onMessage('text', Buffer.from('early'));
-    await new Promise((r) => setTimeout(r, 80));
+    // 条件轮询替代固定 sleep：负载下固定 80ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (conn.data.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(conn.data[0]?.payload.toString()).toBe('early');
   });
 
@@ -224,7 +253,11 @@ describe('WsChannel', () => {
       connection: conn.asConnection(), authorize: ALLOW, logger: nullLogger, onDone: () => {},
     });
     await ch.start();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!conn.controls.some((f) => f.type === 'ws.accept') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(conn.controls.find((f) => f.type === 'ws.accept')).toBeDefined();
     expect(up.headers[0]?.['sec-websocket-protocol']).toBeUndefined();
   });
@@ -241,7 +274,12 @@ describe('WsChannel', () => {
       connection: conn.asConnection(), authorize: ALLOW, logger, onDone: () => { done += 1; },
     });
     await ch.start();
-    await new Promise((r) => setTimeout(r, 50)); // 等 accept（pending 已置 null 走直发）
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）；
+    // 等 accept 完成（pending 已置 null，onMessage 走直发路径）
+    const deadline = Date.now() + 5000;
+    while (!conn.controls.some((f) => f.type === 'ws.accept') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     // 模拟 CLOSING/CONNECTING 窗口：ws 在非 OPEN 态 send 会同步抛（真实 ws 代码路径）
     const upstreamWs = (ch as unknown as { upstream: { _readyState: number } }).upstream;
     upstreamWs._readyState = 0; // CONNECTING
@@ -264,7 +302,12 @@ describe('WsChannel', () => {
       onDone: () => { done += 1; },
     });
     await ch.start();
-    await new Promise((r) => setTimeout(r, 50)); // 等 accept 完成
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）；
+    // 等 accept 完成（upstream 客户端已入列 wss.clients）
+    const upDeadline = Date.now() + 5000;
+    while (up.wss.clients.size === 0 && Date.now() < upDeadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     const upstreamWs = [...up.wss.clients][0]!;
     upstreamWs.send(Buffer.alloc(100 * 1024 * 1024 - 32));
     // 大消息接收 + 关闭握手需要时间，轮询等通道收尾（防固定 sleep 抖动）
@@ -290,9 +333,18 @@ describe('WsChannel', () => {
       connection: conn.asConnection(), authorize: ALLOW, logger: nullLogger, onDone: () => {},
     });
     await ch.start();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）；
+    // 等 upstream 已连上（close 动作才能透传到 up.closes）
+    const upDeadline = Date.now() + 5000;
+    while (up.wss.clients.size === 0 && Date.now() < upDeadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(() => ch.onPeerClose({ type: 'channel.close', channelId: 1, code: 1005, reason: 'x' })).not.toThrow();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (up.closes.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(up.closes[0]?.code).toBe(1000); // 非法码被替换为默认 1000
   });
 
@@ -305,9 +357,18 @@ describe('WsChannel', () => {
       connection: conn.asConnection(), authorize: ALLOW, logger: nullLogger, onDone: () => {},
     });
     await ch.start();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）；
+    // 等 upstream 已连上（close 动作才能透传到 up.closes）
+    const upDeadline = Date.now() + 5000;
+    while (up.wss.clients.size === 0 && Date.now() < upDeadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(() => ch.onPeerClose({ type: 'channel.close', channelId: 1, code: 3000, reason: 'x'.repeat(200) })).not.toThrow();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (up.closes.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(up.closes[0]?.code).toBe(3000); // 合法码原样透传
     expect(up.closes[0]?.reason.length).toBeLessThanOrEqual(123); // reason 截断到 123 字节内
   });
@@ -326,10 +387,19 @@ describe('WsChannel', () => {
       onDone: () => { done += 1; },
     });
     await ch.start();
-    await new Promise((r) => setTimeout(r, 50)); // 等 accept 完成
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）；
+    // 等 upstream 客户端入列（accept 完成），再置隧道断——保证消息确实走上 echo 路径
+    const upDeadline = Date.now() + 5000;
+    while (up.wss.clients.size === 0 && Date.now() < upDeadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     conn.tunnelDown = true;
     ch.onMessage('text', Buffer.from('ping')); // 浏览器→upstream 方向仍通，触发 echo 回传
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (done === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(done).toBe(1);
   });
 
@@ -344,10 +414,20 @@ describe('WsChannel', () => {
       onDone: () => { done += 1; },
     });
     await ch.start();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）；
+    // 必须等 upstream 客户端入列再 close——若未连上，clients 为空、无人触发 close，
+    // done 永不翻转（close 驱动路径的唯一收敛源），负载下即 5s 超时假失败
+    const upDeadline = Date.now() + 5000;
+    while (up.wss.clients.size === 0 && Date.now() < upDeadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     conn.tunnelDown = true;
     for (const ws of up.wss.clients) ws.close(1001, 'going away');
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (done === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(done).toBe(1);
   });
 });

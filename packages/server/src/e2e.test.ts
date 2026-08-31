@@ -143,8 +143,12 @@ describe('e2e：HTTP 转发', () => {
     const tunnelId = client.tunnelId ?? '';
     const cookie = await selectAndGetCookie(tunnelId, 'good-token');
     client.close();
-    // 宏观等待窗口：等服务端 close 事件完成 teardown + 注册表注销（100ms 远大于本地回路）
-    await new Promise((r) => setTimeout(r, 100));
+    // 条件轮询替代固定 sleep：负载下固定 100ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    const registry = (server as unknown as { tunnels: { has(id: string): boolean } }).tunnels;
+    while (registry.has(tunnelId) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     const offline = await fetch(`${base()}/api/x`, { headers: { cookie } });
     expect(offline.status).toBe(502);
     // 同一客户端重连（hello 回带上次 tunnelId）→ 复用成功，sessions 保留免重新选择

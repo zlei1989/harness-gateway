@@ -266,7 +266,11 @@ describe('handleBrowserHttp', () => {
     const { port, tunnel, uuid } = await setup();
     tunnel.autoRespond = null;
     const pending = fetch(`http://127.0.0.1:${port}/api/x`, { headers: { cookie: `gateway_sid=${uuid}` } });
-    await new Promise((r) => setTimeout(r, 30));
+    // 条件轮询替代固定 sleep：负载下固定 30ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (tunnel.openFrames.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     const channelId = tunnel.openFrames[0]?.channelId ?? 0;
     tunnel.tunnelDown(channelId);
     const res = await pending;

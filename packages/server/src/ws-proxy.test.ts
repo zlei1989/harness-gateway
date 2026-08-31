@@ -158,7 +158,11 @@ describe('handleBrowserWs', () => {
 
     // 浏览器 → 隧道
     ws.send('hello');
-    await new Promise((r) => setTimeout(r, 30));
+    // 条件轮询替代固定 sleep：负载下固定 30ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (tunnel.messages.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(tunnel.messages[0]).toMatchObject({ dataType: 'text' });
     expect(tunnel.messages[0]?.payload.toString()).toBe('hello');
 

@@ -131,7 +131,11 @@ describe('Connection', () => {
     await conn.connect();
     expect(conn.ready).toBe(true);
     gw.sockets[0]?.close(4409, 'hostname conflict');
-    await new Promise((r) => setTimeout(r, 200));
+    // 条件轮询替代固定 sleep：负载下固定 200ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while ((fatals.length === 0 || gw.sockets.length > 0) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(fatals).toHaveLength(1);
     expect(fatals[0]?.message).toMatch(/4409/);
     expect(conn.ready).toBe(false);
@@ -295,7 +299,11 @@ describe('Connection', () => {
     expect(conn.ready).toBe(true);
     await new Promise((r) => setTimeout(r, 60)); // 拉开 readyMs 使可断言 >0
     gw.sockets[0]?.close(1011, 'upstream boom');
-    await new Promise((r) => setTimeout(r, 100));
+    // 条件轮询替代固定 sleep：负载下固定 100ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!warns.some((w) => w.msg === '隧道连接断开') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     const entry = warns.find((w) => w.msg === '隧道连接断开');
     expect(entry).toBeDefined();
     expect(entry?.meta).toMatchObject({ code: 1011, reason: 'upstream boom' });
@@ -343,7 +351,11 @@ describe('Connection', () => {
     conn.on('error', () => {});
     await conn.connect();
     await conn.close();
-    await new Promise((r) => setTimeout(r, 150));
+    // 条件轮询替代固定 sleep：负载下固定 150ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (gw.sockets.length > 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(gw.sockets.length).toBe(0);
     await gw.close();
   });
@@ -420,7 +432,11 @@ describe('Connection', () => {
     expect(calls.disconnected).toBe(0);
     // 后续帧仍正常路由（隧道功能完好）
     gw.sockets[0]?.send(encodeControl({ type: 'channel.error', channelId: 1, message: 'x' }));
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!calls.control.some((f) => f.type === 'channel.error') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(calls.control.some((f) => f.type === 'channel.error')).toBe(true);
     await conn.close();
     await gw.close();
@@ -442,6 +458,12 @@ describe('Connection', () => {
     let closeCode: number | null = null;
     gw.sockets[0]?.on('close', (code) => { closeCode = code; });
     gw.sockets[0]?.send(encodeData({ channelId: 1, kind: 'ws.message' }, Buffer.from('x')));
+    // 条件轮询替代固定 sleep：负载下固定 300ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (calls.data.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    // 保留原观察窗：确认隧道未收到任何关闭（close 握手远快于该窗口）
     await new Promise((r) => setTimeout(r, 300));
     expect(errors.length).toBeGreaterThan(0);
     expect(calls.data).toHaveLength(1); // 帧已送达回调
@@ -481,7 +503,11 @@ describe('Connection', () => {
     expect(warns.join('\n') + errors.join('\n')).not.toContain('secret-token-xyz');
     // 后续帧仍正常路由（隧道功能完好）
     gw.sockets[0]?.send(encodeControl({ type: 'channel.error', channelId: 1, message: 'x' }));
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!calls.control.some((f) => f.type === 'channel.error') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(calls.control.some((f) => f.type === 'channel.error')).toBe(true);
     await conn.close();
     await gw.close();
@@ -506,7 +532,11 @@ describe('Connection', () => {
     expect(calls.disconnected).toBe(0);
     // 后续数据帧正常路由
     gw.sockets[0]?.send(encodeData({ channelId: 7, kind: 'ws.message' }, Buffer.from('ok')));
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!calls.data.some((h) => h.channelId === 7) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(calls.data.some((h) => h.channelId === 7)).toBe(true);
     await conn.close();
     await gw.close();
@@ -556,6 +586,12 @@ describe('Connection', () => {
     for (let i = 0; i < 4; i++) sock?.send(`bad-${i}`);
     sock?.send(encodeControl({ type: 'channel.error', channelId: 1, message: 'x' }));
     for (let i = 0; i < 4; i++) sock?.send(`bad2-${i}`);
+    // 条件轮询替代固定 sleep：负载下固定 300ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!calls.control.some((f) => f.type === 'channel.error') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    // 保留原观察窗：8 帧坏帧未升级为隧道级断开（close 握手远快于该窗口）
     await new Promise((r) => setTimeout(r, 300));
     expect(closeCode).toBeNull();
     expect(calls.disconnected).toBe(0);
@@ -627,7 +663,12 @@ describe('tunnel.ack 端到端流量窗口', () => {
     gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: 0 }));
     await new Promise((r) => setTimeout(r, 100));
     gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: 1024 * 1024 }));
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while ((conn as unknown as { dataBytesAcked: number }).dataBytesAcked < 1024 * 1024
+      && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     // 在途 3MiB：超最小窗口 256KiB 但低于自适应窗口 4MiB → 不背压
     expect(conn.sendData({ channelId: 1, kind: 'http.body' }, bigPayload())).toBe(true);
     await conn.close();
@@ -641,9 +682,14 @@ describe('tunnel.ack 端到端流量窗口', () => {
     conn.on('error', () => {});
     await conn.connect();
     gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: 10 * 1024 * 1024 }));
-    await new Promise((r) => setTimeout(r, 50));
     gw.sockets[0]?.send(encodeControl({ type: 'tunnel.ack', bytes: 1024 })); // 回退值：必须忽略
-    await new Promise((r) => setTimeout(r, 50));
+    // 在序哨兵替代固定 sleep：ws 消息按序投递，ping 的回执 pong 到达即证明其前方两条 ack
+    // 均已处理完（负载下固定 50ms 会被击穿；而"轮询 ack 口径"会在回退帧处理前退出导致假绿）
+    gw.sockets[0]?.send(encodeControl({ type: 'ping' }));
+    const deadline = Date.now() + 5000;
+    while (!gw.received.some((f) => f.type === 'pong') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     // ack 口径仍是 10MiB：3MiB 在途 - 10MiB ack < 0 → 不超窗
     expect(conn.sendData({ channelId: 1, kind: 'http.body' }, bigPayload())).toBe(true);
     await conn.close();

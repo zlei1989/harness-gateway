@@ -124,7 +124,11 @@ describe('HttpChannel', () => {
     });
     await ch.start();
     ch.onBodyEnd();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (up.hits.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(up.hits[0]?.headers['host']).toBe(`127.0.0.1:${up.url.port}`);
     expect(up.hits[0]?.headers['origin']).toBe(up.url.origin);
   });
@@ -182,7 +186,11 @@ describe('HttpChannel', () => {
     });
     await ch.start();
     ch.onBodyEnd();
-    await new Promise((r) => setTimeout(r, 200));
+    // 条件轮询替代固定 sleep：负载下固定 200ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!conn.controls.some((f) => f.type === 'http.head') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     // 首次落在陈旧 socket 上被 RST → 重试换新 socket → 200
     expect(warns.some((m) => m.includes('陈旧连接'))).toBe(true);
     const head = conn.controls.find((f) => f.type === 'http.head');
@@ -201,7 +209,11 @@ describe('HttpChannel', () => {
     ch.onBody(part);
     ch.onBody(part);
     ch.onBodyEnd();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (up.hits.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(up.hits[0]?.body.length).toBe(128 * 1024);
   });
 
@@ -243,7 +255,11 @@ describe('HttpChannel', () => {
     });
     await ch.start();
     ch.onBodyEnd();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!conn.controls.some((f) => f.type === 'http.head') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     const head = conn.controls.find((f) => f.type === 'http.head');
     expect(head && 'headers' in head && head.headers['set-cookie']).toEqual(['a=1', 'b=2']);
   });
@@ -276,7 +292,12 @@ describe('HttpChannel', () => {
     });
     await ch.start();
     ch.onBodyEnd();
-    await new Promise((r) => setTimeout(r, 100));
+    // 条件轮询替代固定 sleep：负载下固定 100ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while ((!conn.controls.some((f) => f.type === 'http.head')
+      || conn.data.at(-1)?.header.kind !== 'http.body.end') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(conn.controls.find((f) => f.type === 'http.head')).toMatchObject({ status: 502 });
     expect(conn.data.at(-1)?.header.kind).toBe('http.body.end');
     // 502 体为固定文案：err.message 含内网地址/端口，回显会泄露给浏览器侧
@@ -297,9 +318,19 @@ describe('HttpChannel', () => {
     });
     await ch.start();
     ch.onBodyEnd();
-    await new Promise((r) => setTimeout(r, 30));
+    // 条件轮询替代固定 sleep：负载下固定 30ms 会被 CPU 争用击穿（时序抖动族）；
+    // 首块 body 已发出即说明 failNextSend 背压已生效，此时 drain 才有效
+    const pauseDeadline = Date.now() + 5000;
+    while (!conn.data.some((d) => d.header.kind === 'http.body') && Date.now() < pauseDeadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     conn.drain();
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (Buffer.concat(conn.data.filter((d) => d.header.kind === 'http.body')
+      .map((d) => d.payload)).length < body.length && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(Buffer.concat(conn.data.filter((d) => d.header.kind === 'http.body').map((d) => d.payload)).toString()).toBe(body);
   });
 
@@ -333,7 +364,11 @@ describe('HttpChannel', () => {
     });
     await ch.start();
     ch.onBodyEnd();
-    await new Promise((r) => setTimeout(r, 100));
+    // 条件轮询替代固定 sleep：负载下固定 100ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (done === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(done).toBe(1);
     expect(conn.controls.find((f) => f.type === 'http.head')).toBeUndefined();
   });
@@ -361,7 +396,11 @@ describe('HttpChannel', () => {
     expect(conn.data.filter((d) => d.header.kind === 'http.body').map((d) => d.payload.toString())).toEqual(['chunk1']);
     conn.tunnelDown = true; // 第二块到达时隧道已断
     sendSecond!();
-    await new Promise((r) => setTimeout(r, 100));
+    // 条件轮询替代固定 sleep：负载下固定 100ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (done === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(done).toBe(1);
   });
 });
@@ -396,7 +435,7 @@ describe('HttpChannel 压缩传输（compress）', () => {
 
   async function runChannel(
     conn: FakeConnection, upstream: URL,
-    openOverrides: Partial<HttpOpenFrame> = {}, compress = true,
+    openOverrides: Partial<HttpOpenFrame> = {}, compress = true, waitComplete = true,
   ): Promise<void> {
     const ch = new HttpChannel({
       id: 1, open: makeOpen({ headers: { host: 'gateway.example', ...ACCEPT_BR }, ...openOverrides }),
@@ -405,7 +444,14 @@ describe('HttpChannel 压缩传输（compress）', () => {
     });
     await ch.start();
     ch.onBodyEnd();
-    await new Promise((r) => setTimeout(r, 100));
+    // 条件轮询替代固定 sleep：负载下固定 100ms 会被 CPU 争用击穿（时序抖动族）；
+    // waitComplete=false 供背压用例在 drain 前先返回（收尾状态由其自行轮询）
+    const deadline = Date.now() + 5000;
+    while ((!conn.controls.some((f) => f.type === 'http.head')
+      || (waitComplete && conn.data.at(-1)?.header.kind !== 'http.body.end'))
+      && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
   }
 
   it('accept-encoding 含 br：以 br 压缩回传，head 改写 content-encoding/删 content-length/补 vary，body 解码后还原', async () => {
@@ -515,9 +561,19 @@ describe('HttpChannel 压缩传输（compress）', () => {
     const up = await startTextUpstream();
     const conn = new FakeConnection();
     conn.failNextSend = true;
-    await runChannel(conn, up.url);
+    await runChannel(conn, up.url, {}, true, false);
+    // 条件轮询替代固定 sleep：负载下固定 100ms 会被 CPU 争用击穿（时序抖动族）；
+    // 首块 body 已发出即说明 failNextSend 背压已生效，此时 drain 才有效
+    const pauseDeadline = Date.now() + 5000;
+    while (!conn.data.some((d) => d.header.kind === 'http.body') && Date.now() < pauseDeadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     conn.drain();
-    await new Promise((r) => setTimeout(r, 100));
+    // 条件轮询替代固定 sleep：负载下固定 100ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (conn.data.at(-1)?.header.kind !== 'http.body.end' && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(zlib.brotliDecompressSync(collectBody(conn)).toString()).toBe(BIG_TEXT);
   });
 });

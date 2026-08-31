@@ -3,7 +3,7 @@
  * 注意（测试基建）：
  * - ws@8.21.2 客户端 close 不自动 terminate，且 http.Server.close 会等悬挂连接，
  *   故统一在 afterEach 先 terminate 所有客户端再 close server，防止挂起；
- * - 时序断言（断开清理）需留出宏任务窗口（setTimeout）。
+ * - 时序断言（断开清理）改为条件轮询等待异步迁移完成（固定宏任务窗口在负载下会被击穿）。
  */
 
 import { randomUUID } from 'node:crypto';
@@ -108,8 +108,11 @@ describe('隧道接入', () => {
     await new Promise<void>((r) => ws1.on('open', r));
     const id1 = await helloAck(ws1, 'pc-a');
     ws1.terminate();
-    // 宏任务窗口：等服务端 close 事件完成注销
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (tunnels.has(id1) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(tunnels.has(id1)).toBe(false);
 
     const ws2 = connectWs();
@@ -161,8 +164,11 @@ describe('隧道接入', () => {
     await new Promise<void>((r) => ws1.on('open', r));
     const id = await helloAck(ws1, 'pc-a');
     ws1.terminate();
-    // 宏任务窗口：等服务端 close 事件完成注销
-    await new Promise((r) => setTimeout(r, 50));
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (tunnels.has(id) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(tunnels.has(id)).toBe(false);
 
     const ws2 = connectWs();
@@ -225,7 +231,11 @@ describe('隧道接入', () => {
     for (let i = 0; i < 7; i++) ws.send(`bad-${i}`);
     const code = await new Promise<number>((r) => ws.on('close', (c) => r(c)));
     expect(code).toBe(1002);
-    await new Promise((r) => setTimeout(r, 50)); // 等 close 事件完成注销
+    // 条件轮询替代固定 sleep：负载下固定 50ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (tunnels.has(id) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(tunnels.has(id)).toBe(false);
     expect(warns.filter((m) => m.includes('坏帧'))).toHaveLength(4); // 预算内逐帧 WARN
     expect(errors).toHaveLength(1); // 仅升级瞬间一条 ERROR（latch 防日志洪泛）
@@ -267,7 +277,11 @@ describe('隧道接入', () => {
       handleControl: () => { throw new Error('boom'); },
     });
     ws.send(encodeControl({ type: 'ping' }));
-    await new Promise((r) => setTimeout(r, 100));
+    // 条件轮询替代固定 sleep：负载下固定 100ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!errors.some((m) => m.includes('路由异常')) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(errors.some((m) => m.includes('路由异常'))).toBe(true);
     // 隧道未被关闭：恢复正常路由后 ping → pong 证明功能完好
     Object.assign(session, { handleControl: original });

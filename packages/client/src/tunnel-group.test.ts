@@ -42,7 +42,11 @@ describe('TunnelGroup', () => {
   it('老服务端（ack 无 multiConn）：不发起 attach，单 leg 运行，帧不带 seq', async () => {
     const g = makeGroup(4);
     await g.connect();
-    await new Promise((r) => setTimeout(r, 200));
+    // 条件轮询替代固定 sleep：负载下固定 200ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while ((g.readyLegCount === 0 || gateway.connectionCount === 0) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(g.readyLegCount).toBe(1);
     expect(gateway.connectionCount).toBe(1);
     // 协商失败降级单连接：任何帧都不带 seq（spec §3.3）

@@ -84,7 +84,12 @@ describe('Client 生命周期与帧路由', () => {
     const closing = client.close();
     gw.send({ type: 'http.open', channelId: 9, method: 'GET', url: '/', headers: {} });
     await closing;
-    await new Promise((r) => setTimeout(r, 30));
+    // 条件轮询替代固定 sleep：负载下固定 30ms 会被 CPU 争用击穿（时序抖动族）
+    const deadline = Date.now() + 5000;
+    while (!gw.received.some((f) => f.type === 'channel.error' && f.channelId === 9)
+      && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     expect(gw.received.some((f) => f.type === 'channel.error' && f.channelId === 9)).toBe(true);
     await gw.close();
   });
