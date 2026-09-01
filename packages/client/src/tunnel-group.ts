@@ -11,7 +11,10 @@
 
 import { EventEmitter } from 'node:events';
 
-import { Connection, type ReconnectOptions, type TunnelSender } from './connection';
+import {
+  type CodedError, Connection, ERR_ATTACH_REJECTED, ERR_CLOSED_BY_CALLER, ERR_HOSTNAME_CONFLICT,
+  ERR_RECONNECT_EXHAUSTED, type ReconnectOptions, type TunnelSender,
+} from './connection';
 
 import type { Logger } from './logger';
 import type { ControlFrame, DataHeader } from './protocol';
@@ -22,6 +25,8 @@ export interface TunnelGroupOptions {
   /** 目标总连接数（含 primary，≥2 才会建组；Client 在 ==1 时直接用 Connection） */
   connections: number;
   heartbeatIntervalMs: number;
+  /** 心跳判死宽容度透传（可选，默认 3，见 connection.ts ConnectionOptions.heartbeatMaxMissed） */
+  heartbeatMaxMissed?: number;
   connectTimeoutMs: number;
   reconnect: ReconnectOptions;
   logger: Logger;
@@ -48,6 +53,10 @@ export class TunnelGroup extends EventEmitter implements TunnelSender {
   private readonly sendSeq = new Map<number, number>();
   private closing = false;
   private disconnected = false;
+  /** 组级重建 latch：重建启动 → primary 重新就绪前，其余 leg 的断事件折叠（防多腿同断/交错断叠加重建） */
+  private rebuilding = false;
+  /** 隧道代际（primary 每次就绪 +1）：attach 重试定时器跨代失效（防旧代幽灵 leg 覆盖新代槽位） */
+  private generation = 0;
 
   constructor(
     private readonly opts: TunnelGroupOptions,
@@ -57,6 +66,8 @@ export class TunnelGroup extends EventEmitter implements TunnelSender {
     this.primary = this.newLeg(false, undefined);
     // onDisconnected 单点上抛：仅 primary 驱动（attach leg 断 → forceReconnect 间接触发同一路径）
     this.primary.on('connected', () => {
+      this.generation += 1;
+      this.rebuilding = false;
       this.disconnected = false;
       this.emit('connected');
       this.spawnAttachLegs();
@@ -119,8 +130,9 @@ export class TunnelGroup extends EventEmitter implements TunnelSender {
     return Promise.race(legs.map((l) => l.waitDrain())).then(() => undefined);
   }
 
-  /** Resequencer 溢出等组级协议错误处置：整组重连 */
+  /** Resequencer 溢出等组级协议错误处置：整组重连（置重建 latch，窗口内其余 leg 断事件折叠） */
   forceReconnect(): void {
+    this.rebuilding = true;
     this.closeAttachLegs();
     this.primary.forceReconnect();
   }
@@ -171,7 +183,9 @@ export class TunnelGroup extends EventEmitter implements TunnelSender {
         hello: attach
           ? { ...this.opts.hello, attach: true, initialTunnelId: tunnelId }
           : { ...this.opts.hello, multiConn: { count: this.opts.connections } },
+        role: attach ? 'attach' : 'primary', // 断开日志角色字段 + 终态错误日志分级依据
         heartbeatIntervalMs: this.opts.heartbeatIntervalMs,
+        heartbeatMaxMissed: this.opts.heartbeatMaxMissed,
         connectTimeoutMs: attach ? ATTACH_CONNECT_TIMEOUT_MS : this.opts.connectTimeoutMs,
         reconnect: attach
           ? { ...this.opts.reconnect, maxRetries: 0 }
@@ -184,8 +198,15 @@ export class TunnelGroup extends EventEmitter implements TunnelSender {
         onDisconnected: () => { if (attach) this.onAttachLegDown(); },
       },
     );
-    // EventEmitter 语义：'error' 必须挂监听；诊断上抛给 Client 的统一 'error'
-    leg.on('error', (err: Error) => this.emit('error', err));
+    // EventEmitter 语义：'error' 必须挂监听。attach leg 的终态错误（4410/重连耗尽）
+    // 由组语义接管（重试/槽位降级/整组重建），不上抛防 Client 记 ERROR 噪音；
+    // 瞬时 ws 错误（中间盒非法帧等）上抛供 Client 统一指纹分级
+    leg.on('error', (err: Error) => {
+      const code = (err as CodedError).code;
+      if (code === ERR_ATTACH_REJECTED || code === ERR_RECONNECT_EXHAUSTED
+        || code === ERR_HOSTNAME_CONFLICT) return;
+      this.emit('error', err);
+    });
     if (attach) {
       // attach leg（maxRetries:0）终态由组语义覆盖（整组重建/槽位降级），吞掉防噪音，
       // 不让 Client 误落 error 态；仅留 debug 诊断
@@ -217,25 +238,31 @@ export class TunnelGroup extends EventEmitter implements TunnelSender {
     if (this.closing || this.disconnected) return;
     const leg = this.newLeg(true, tunnelId);
     this.attachLegs[slot] = leg;
-    leg.connect().catch(() => {
+    leg.connect().catch((err: unknown) => {
       if (this.attachLegs[slot] === leg) this.attachLegs[slot] = null;
+      // 主动关闭（整组重建/close 收尾）≠ 连接失败：槽位由新代 spawnAttachLegs 重新填充，
+      // 不再排退避重试——否则旧代幽灵重试会覆盖新代槽位、留下孤儿连接（线上多代风暴根因之一）
+      if ((err as CodedError).code === ERR_CLOSED_BY_CALLER) return;
       if (this.closing || this.primary.tunnelId !== tunnelId) return; // 组已换隧道，等下轮 spawn
       if (attemptNo + 1 >= MAX_ATTACH_ATTEMPTS) {
         this.opts.logger.warn('attach 重试耗尽，该槽位降级到下次整组重连', { slot, attempts: attemptNo + 1 });
         return;
       }
       const delay = this.opts.reconnect.baseDelayMs * 2 ** attemptNo;
+      const gen = this.generation;
       const timer = setTimeout(() => {
         this.attachTimers.delete(slot);
+        if (this.generation !== gen) return; // 跨代重试：组已重建，槽位由新代接管
         this.startAttach(slot, tunnelId, attemptNo + 1);
       }, Math.min(delay, this.opts.reconnect.maxDelayMs));
       this.attachTimers.set(slot, timer);
     });
   }
 
-  /** 已就绪 attach leg 断 = 整组断（spec §4.4）：收其余 leg，primary forceReconnect 驱动重连 */
+  /** 已就绪 attach leg 断 = 整组断（spec §4.4）：收其余 leg，primary forceReconnect 驱动重连；
+   *  重建 latch 已置时折叠（组已在重建，本 leg 由 closeAttachLegs 收掉，防多重重建） */
   private onAttachLegDown(): void {
-    if (this.closing || this.disconnected) return;
+    if (this.closing || this.disconnected || this.rebuilding) return;
     this.opts.logger.warn('attach leg 断开，整组重建');
     this.forceReconnect();
   }

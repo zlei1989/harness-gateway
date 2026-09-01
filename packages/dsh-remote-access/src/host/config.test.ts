@@ -65,6 +65,24 @@ describe('loadConfig', () => {
       expect(loadConfig(home).heartbeatIntervalMs).toBeUndefined();
     }
   });
+
+  it('可选字段 tunnelPerMessageDeflate：仅 boolean 透传（false 用于中间盒误杀压缩帧的对照验证）', () => {
+    const path = configPath(home);
+    saveConfig(home, { hostname: 'pc-a', token: 'tok12345', gateway: 'gw.example.com', compress: true });
+    const base = 'hostname: pc-a\ntoken: tok12345\ngateway: gw.example.com\ncompress: true\n';
+    // 未配置 → undefined（由 gateway-client/ws 默认提议压缩接管）
+    writeFileSync(path, base, 'utf8');
+    expect(loadConfig(home).tunnelPerMessageDeflate).toBeUndefined();
+    expect(readFileSync(path, 'utf8')).toBe(base); // 可选字段不参与补全落盘
+    // 手工配置 false/true → 原样透传
+    for (const v of ['false', 'true']) {
+      writeFileSync(path, `${base}tunnelPerMessageDeflate: ${v}\n`, 'utf8');
+      expect(loadConfig(home).tunnelPerMessageDeflate).toBe(v === 'true');
+    }
+    // 非法值 → 视为未配置
+    writeFileSync(path, `${base}tunnelPerMessageDeflate: off\n`, 'utf8');
+    expect(loadConfig(home).tunnelPerMessageDeflate).toBeUndefined();
+  });
 });
 
 describe('saveConfig', () => {

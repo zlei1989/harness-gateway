@@ -129,6 +129,14 @@ describe('ConnectionManager', () => {
     expect(capturedClientOptions[1]?.heartbeatIntervalMs).toBeUndefined();
   });
 
+  it('enable 将 tunnelPerMessageDeflate 原样透传给 gateway-client 构造参数（缺省传 undefined，Client/ws 默认提议压缩）', async () => {
+    capturedClientOptions.length = 0;
+    await manager.enable({ ...cfg(gateway.url), tunnelPerMessageDeflate: false });
+    await manager.enable(cfg(gateway.url));
+    expect(capturedClientOptions[0]).toMatchObject({ perMessageDeflate: false });
+    expect(capturedClientOptions[1]?.perMessageDeflate).toBeUndefined();
+  });
+
   it('enable 将 deps.defaultPath() 的返回值透传给 gateway-client 构造参数（缺省不传，Client 回落「/」）', async () => {
     capturedClientOptions.length = 0;
     // beforeEach 的 manager 未配 defaultPath 回调 → 构造参数中不得携带（Client 内 defaultPath ?? '/' 接管）

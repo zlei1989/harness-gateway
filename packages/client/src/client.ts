@@ -9,7 +9,7 @@ import http from 'node:http';
 import https from 'node:https';
 
 import { type AuthDecision, type AuthorizationHook, type AuthRequest, runAuthorization } from './authorize';
-import { Connection, type ReconnectOptions } from './connection';
+import { type CodedError, Connection, ERR_RECONNECT_EXHAUSTED, type ReconnectOptions } from './connection';
 import { HttpChannel } from './http-channel';
 import { createDefaultLogger, type Logger } from './logger';
 import { Resequencer } from './resequencer';
@@ -38,6 +38,8 @@ export interface ClientOptions {
   compress?: boolean;
   reconnect?: Partial<ReconnectOptions>;
   heartbeatIntervalMs?: number;
+  /** 心跳判死宽容度（可选，默认 3，见 connection.ts ConnectionOptions.heartbeatMaxMissed） */
+  heartbeatMaxMissed?: number;
   authTimeoutMs?: number;
   connectTimeoutMs?: number;
   /**
@@ -45,6 +47,11 @@ export interface ClientOptions {
    * 1 = 纯 legacy 单连接（连 multiConn 协商都不发）。老服务端自动降级单连接。
    */
   connections?: number;
+  /**
+   * 隧道 WS permessage-deflate 开关：false = 客户端不提议压缩（排查中间盒误杀压缩帧 /
+   * 降低 CPU 用）。缺省 = ws 库默认（提议压缩；服务端不协商则不生效）。
+   */
+  perMessageDeflate?: boolean;
   logger?: Logger;
 }
 
@@ -115,12 +122,16 @@ export class Client extends EventEmitter {
     const connOpts = {
       gatewayUrl: options.gatewayUrl,
       hello: { hostname: options.hostname, defaultPath: options.defaultPath ?? '/' },
+      perMessageDeflate: options.perMessageDeflate,
       heartbeatIntervalMs: options.heartbeatIntervalMs ?? 30_000,
+      // 判死宽容度原样透传：undefined 时 Connection 回落缺省 3（判死窗 = 间隔 × 3）
+      heartbeatMaxMissed: options.heartbeatMaxMissed,
       connectTimeoutMs: options.connectTimeoutMs ?? 60_000,
       reconnect: {
         baseDelayMs: options.reconnect?.baseDelayMs ?? 1000,
         maxDelayMs: options.reconnect?.maxDelayMs ?? 30_000,
         maxRetries: options.reconnect?.maxRetries ?? Infinity,
+        churnThresholdMs: options.reconnect?.churnThresholdMs,
       },
       logger: this.logger,
     };
@@ -148,6 +159,10 @@ export class Client extends EventEmitter {
       // 不按通用隧道故障记 ERROR 误导排查方向（现象无变化：断连重连本就由此驱动）
       if (isSynthesizedCloseKill(err)) {
         this.logger.warn('收到中间盒合成的非法 close 帧，隧道由内建重连恢复', { error: err.message });
+      } else if ((err as CodedError).code === ERR_RECONNECT_EXHAUSTED) {
+        // 重连耗尽：primary/单连接的终态经 'fatal' 由外层落 error 态，attach leg 由
+        // TunnelGroup 组语义接管——'error' 事件仍上抛（监听契约不变），仅日志降 debug
+        this.logger.debug('重连次数耗尽（终态由外层/组语义处理）', { error: err.message });
       } else {
         this.logger.error('隧道连接错误', { error: err.stack ?? err.message });
       }

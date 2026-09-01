@@ -3,6 +3,8 @@
  * 注意：全部用内存 MockGateway（随机端口）真实走 WS，不用假定时器，避免脆弱时序断言。
  */
 
+import { createServer } from 'node:http';
+
 import { describe, expect, it, vi } from 'vitest';
 import { WebSocketServer, WebSocket as WsWebSocket } from 'ws';
 
@@ -24,9 +26,12 @@ class MockGateway {
   ackDelayMs = 0;
   /** 测试旋钮：是否应答 ping（false = 模拟对端永不回 pong 的静默链路） */
   answerPings = true;
+  /** 最近一次升级请求的头部名列表（permessage-deflate 提议断言用，取自 connection 事件的 req） */
+  upgradeHeaderNames: string[] = [];
 
   constructor() {
-    this.wss.on('connection', (ws) => {
+    this.wss.on('connection', (ws, req) => {
+      this.upgradeHeaderNames = Object.keys(req.headers);
       this.sockets.push(ws);
       // 连接关闭后从存活列表移除（sockets 语义 = 当前存活隧道，供 close 用例断言）
       ws.on('close', () => {
@@ -213,6 +218,36 @@ describe('Connection', () => {
     await conn.close();
   });
 
+  // attach leg 的重连预算（maxRetries:0）由 TunnelGroup 组语义接管：已就绪被杀后的
+  // "重连次数耗尽"终态按 debug 降噪（线上风暴期每轮 ×3 的 WARN 刷屏修复）
+  it('attach leg 重连耗尽：终态日志降 debug（不刷 WARN）', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    const logs: Array<{ level: string; msg: string }> = [];
+    const logger = {
+      debug(msg: string) { logs.push({ level: 'debug', msg }); },
+      info() {},
+      warn(msg: string) { logs.push({ level: 'warn', msg }); },
+      error() {},
+    } as unknown as import('./logger').Logger;
+    const conn = new Connection({
+      gatewayUrl: gw.url, ...OPTS,
+      role: 'attach',
+      reconnect: { ...OPTS.reconnect, maxRetries: 0 },
+      logger,
+    }, handlers);
+    conn.on('error', () => {});
+    conn.on('fatal', () => {});
+    await conn.connect();
+    gw.dropAll(); // 已就绪 attach leg 被杀 → wasReady → attempts(0) >= maxRetries(0) → 终态
+    await vi.waitFor(() => {
+      expect(logs.some((l) => l.msg === '重连次数耗尽，停止重试')).toBe(true);
+    });
+    expect(logs.find((l) => l.msg === '重连次数耗尽，停止重试')?.level).toBe('debug');
+    await conn.close();
+    await gw.close();
+  });
+
   it('瞬时断线（中间件杀连接）不 emit fatal：内建重连自动恢复', async () => {
     const gw = new MockGateway();
     const { handlers } = makeHandlers();
@@ -255,14 +290,40 @@ describe('Connection', () => {
     // baseDelayMs 拉大到 2000ms 制造可分辨窗口：走退避的旧行为下第二次 hello ≥1s 后才到
     const conn = new Connection({
       gatewayUrl: gw.url, ...OPTS,
-      reconnect: { baseDelayMs: 2000, maxDelayMs: 8000, maxRetries: Infinity },
+      reconnect: {
+        baseDelayMs: 2000, maxDelayMs: 8000, maxRetries: Infinity, churnThresholdMs: 50,
+      },
     }, handlers);
     conn.on('error', () => {});
     await conn.connect();
-    gw.dropAll(); // 已就绪会话被杀（中间盒杀连接/瞬断场景：连接刚刚还健康，立即重试是安全的）
+    // 代寿命越过 churnThresholdMs(50)：健康代被杀（中间盒杀连接/瞬断场景）立即重试安全
+    await new Promise((r) => setTimeout(r, 60));
+    gw.dropAll();
     await vi.waitFor(() => {
       expect(gw.received.filter((f) => f.type === 'hello')).toHaveLength(2);
     }, { timeout: 800, interval: 20 }); // 远小于 baseDelayMs=2000 的窗口内必须到达
+    await conn.close();
+    await gw.close();
+  });
+
+  // 线上重连风暴修复：短命代（就绪后很快被杀）零延迟重连只会被中间盒再杀（日志实测
+  // 代寿命 0.2-1.4s 连续绞杀），按连击数指数退避拉断风暴；健康代被杀仍立即重连
+  it('短命代（就绪后很快被杀）重连进入退避：风暴期不再零延迟热循环', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    const conn = new Connection({
+      gatewayUrl: gw.url, ...OPTS,
+      reconnect: { baseDelayMs: 200, maxDelayMs: 800, maxRetries: Infinity },
+    }, handlers);
+    conn.on('error', () => {});
+    await conn.connect();
+    gw.dropAll(); // 就绪后立即被杀 → generationMs < churnThresholdMs(5000) → churn 退避
+    const t0 = Date.now();
+    await vi.waitFor(() => {
+      expect(gw.received.filter((f) => f.type === 'hello')).toHaveLength(2);
+    }, { timeout: 3000, interval: 10 });
+    // 零延迟热循环下 <20ms 即达；churn 退避 ≥ baseDelayMs×0.5 = 100ms（留 10ms 量化余量）
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(90);
     await conn.close();
     await gw.close();
   });
@@ -312,6 +373,118 @@ describe('Connection', () => {
     await gw.close();
   });
 
+  // 线上 1006 排查增强：断开日志附带帧轨迹/在途量/角色/tunnelId——区分"流量触发被杀"
+  // （死前刚发过大帧、inFlightBytes>0）与"空闲回收"（死前只有心跳），中间盒场景离线可判
+  it('断开诊断日志：附带 lastFrames/inFlightBytes/silentMs/role/tunnelId', async () => {
+    const gw = new MockGateway();
+    const { handlers } = makeHandlers();
+    const warns: { msg: string; meta?: Record<string, unknown> }[] = [];
+    const logger = {
+      debug() {}, info() {},
+      warn(msg: string, meta?: unknown) {
+        warns.push({ msg, meta: meta as Record<string, unknown> });
+      },
+      error() {},
+    } as unknown as import('./logger').Logger;
+    const conn = new Connection({ gatewayUrl: gw.url, ...OPTS, logger }, handlers);
+    conn.on('error', () => {});
+    await conn.connect();
+    await new Promise((r) => setTimeout(r, 60)); // 拉开 readyMs 使可断言 >0
+    conn.sendData({ channelId: 999, kind: 'http.body' }, Buffer.alloc(4096)); // 制造在途量与帧轨迹
+    gw.sockets[0]?.terminate(); // 异常断链：TCP 级掐断无 close 帧，客户端 close 事件 code=1006
+    const deadline = Date.now() + 5000;
+    while (!warns.some((w) => w.msg === '隧道连接断开') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const entry = warns.find((w) => w.msg === '隧道连接断开');
+    expect(entry).toBeDefined();
+    expect(entry?.meta).toMatchObject({
+      code: 1006,
+      role: 'primary',
+      tunnelId: 'tid-1',
+    });
+    expect((entry?.meta?.inFlightBytes as number) ?? 0).toBeGreaterThan(0);
+    expect(entry?.meta?.silentMs).toBeTypeOf('number');
+    type FrameTrace = { dir: string; kind: string; len: number; msAgo: number };
+    const frames = entry?.meta?.lastFrames as FrameTrace[];
+    expect(frames).toBeDefined();
+    expect(frames.length).toBeGreaterThan(0);
+    expect(frames.some((f) => f.dir === 'tx' && f.kind === 'http.body')).toBe(true);
+    expect(frames.some((f) => f.dir === 'rx' && f.kind === 'hello.ack')).toBe(true);
+    await conn.close();
+    await gw.close();
+  });
+
+  it('perMessageDeflate=false：升级请求不提议压缩（默认提议 Sec-WebSocket-Extensions）', async () => {
+    const { handlers } = makeHandlers();
+    const gw1 = new MockGateway();
+    const conn1 = new Connection(
+      { gatewayUrl: gw1.url, ...OPTS, perMessageDeflate: false }, handlers,
+    );
+    conn1.on('error', () => {});
+    await conn1.connect();
+    expect(gw1.upgradeHeaderNames.map((n) => n.toLowerCase())).not.toContain('sec-websocket-extensions');
+    await conn1.close();
+    await gw1.close();
+
+    const gw2 = new MockGateway();
+    const conn2 = new Connection({ gatewayUrl: gw2.url, ...OPTS }, handlers);
+    conn2.on('error', () => {});
+    await conn2.connect();
+    expect(gw2.upgradeHeaderNames.map((n) => n.toLowerCase())).toContain('sec-websocket-extensions');
+    await conn2.close();
+    await gw2.close();
+  });
+
+  // 握手被拒观测（线上 bad handshake 排查点）：非 101 响应记状态码 + 响应头指纹；
+  // 头值仅白名单（set-cookie 不落日志防泄 token），头名全集可作中间盒指纹
+  it('握手被拒（unexpected-response）：记状态码与响应头指纹，敏感头值不落日志', async () => {
+    const httpServer = createServer((_req, res) => {
+      res.writeHead(502, {
+        server: 'middlebox/1.0',
+        'content-type': 'text/plain',
+        'x-middlebox-tag': 'fw-9',
+        'set-cookie': 'dsh-session=secret',
+      });
+      res.end('blocked');
+    });
+    await new Promise<void>((r) => httpServer.listen(0, '127.0.0.1', r));
+    const addr = httpServer.address();
+    if (typeof addr === 'string' || addr === null) throw new Error('no addr');
+
+    const { handlers } = makeHandlers();
+    const warns: { msg: string; meta?: Record<string, unknown> }[] = [];
+    const logger = {
+      debug() {}, info() {},
+      warn(msg: string, meta?: unknown) {
+        warns.push({ msg, meta: meta as Record<string, unknown> });
+      },
+      error() {},
+    } as unknown as import('./logger').Logger;
+    // maxRetries 0：首次握手被拒即耗尽 → connect() reject，测试快速收敛不空转重试
+    const conn = new Connection({
+      gatewayUrl: `ws://127.0.0.1:${addr.port}/__gateway__/tunnel`, ...OPTS,
+      reconnect: { baseDelayMs: 20, maxDelayMs: 80, maxRetries: 0 },
+      logger,
+    }, handlers);
+    conn.on('error', () => {});
+    await expect(conn.connect()).rejects.toThrow(/reconnect exhausted/);
+    const entry = warns.find((w) => w.msg === '隧道握手被拒（unexpected-response）');
+    expect(entry).toBeDefined();
+    const meta = entry?.meta as {
+      statusCode: number; headerNames: string[]; headers: Record<string, unknown>;
+    };
+    expect(meta.statusCode).toBe(502);
+    expect(meta.headerNames).toContain('server');
+    expect(meta.headerNames).toContain('x-middlebox-tag');
+    expect(meta.headerNames).toContain('set-cookie'); // 头名可作指纹
+    expect(meta.headers).toMatchObject({ server: 'middlebox/1.0', 'content-type': 'text/plain' });
+    expect(meta.headers['set-cookie']).toBeUndefined(); // 值不落日志（防泄浏览器会话 token）
+    expect(meta.headers['x-middlebox-tag']).toBeUndefined(); // 白名单外的值一律不记
+    await conn.close();
+    await new Promise<void>((r) => httpServer.close(() => r()));
+  });
+
   it('心跳死连接检测：对端静默超过 3 个周期 → 主动断开并重连', async () => {
     const gw = new MockGateway();
     const { handlers } = makeHandlers();
@@ -358,6 +531,31 @@ describe('Connection', () => {
     }
     expect(gw.sockets.length).toBe(0);
     await gw.close();
+  });
+
+  // 线上误报回归：整组重建收掉 CONNECTING 中的 leg 时，ws 库 abortHandshake 发
+  // "WebSocket was closed before the connection was established"——主动关闭（closing）期间的
+  // ws 级错误必须静默，不得上抛成 Client 的 "隧道连接错误" ERROR
+  it('close() 时 ws 仍在 CONNECTING：中止握手不产生隧道 error', async () => {
+    let gotUpgrade = false;
+    // 收到升级请求但不回应：把客户端钉在 CONNECTING（101 未回）
+    const server = createServer(() => { gotUpgrade = true; });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const addr = server.address();
+    if (typeof addr === 'string' || !addr) throw new Error('no addr');
+    const { handlers } = makeHandlers();
+    const conn = new Connection({
+      gatewayUrl: `ws://127.0.0.1:${addr.port}/__gateway__/tunnel`, ...OPTS,
+    }, handlers);
+    const errors: Error[] = [];
+    conn.on('error', (err: Error) => errors.push(err));
+    const pending = conn.connect();
+    pending.catch(() => undefined); // 预期被 close() 以 'connection closed by caller' reject
+    await vi.waitFor(() => { expect(gotUpgrade).toBe(true); });
+    await conn.close(); // ws 仍 CONNECTING → ws.close(1000) 触发 abortHandshake
+    await new Promise((r) => setTimeout(r, 100)); // 迟到的 'error' 窗口
+    expect(errors).toHaveLength(0);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
   it('竞态：connect 超时后迟到的 hello.ack 不得置 ready、不得 emit connected', async () => {

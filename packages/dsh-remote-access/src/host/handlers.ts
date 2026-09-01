@@ -31,10 +31,15 @@ function configFromParams(
   base: RemoteAccessConfig,
 ): RemoteAccessConfig {
   return {
+    // 保留 yaml 手工配置的可选字段（connections/heartbeatIntervalMs/tunnelPerMessageDeflate）：
+    // UI 表单不携带它们，丢弃会静默清掉
+    ...base,
     hostname: typeof params.hostname === 'string' ? params.hostname : base.hostname,
     token: typeof params.token === 'string' ? params.token : base.token,
     gateway: typeof params.gateway === 'string' ? params.gateway : base.gateway,
     compress: typeof params.compress === 'boolean' ? params.compress : base.compress,
+    ...(typeof params.tunnelPerMessageDeflate === 'boolean'
+      ? { tunnelPerMessageDeflate: params.tunnelPerMessageDeflate } : {}),
   };
 }
 

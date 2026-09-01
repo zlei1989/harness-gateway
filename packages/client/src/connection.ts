@@ -31,6 +31,12 @@ export interface ReconnectOptions {
   baseDelayMs: number;
   maxDelayMs: number;
   maxRetries: number;
+  /**
+   * 风暴退避阈值毫秒（可选，默认 5000）：已就绪连接在就绪后该时长内被杀 = 短命代（churn），
+   * 重连不零延迟热循环，按连击数指数退避（封顶 maxDelayMs）拉断风暴；代寿命 ≥ 阈值 =
+   * 健康链路被杀，立即重连（churn 连击归零）。0 = 关闭检测（恒立即重连）。
+   */
+  churnThresholdMs?: number;
 }
 
 export interface ConnectionOptions {
@@ -45,11 +51,63 @@ export interface ConnectionOptions {
     /** attach leg 用：构造即植入的 tunnelId（primary 当前值），优先于进程记忆 */
     initialTunnelId?: string;
   };
+  /**
+   * 隧道 WS permessage-deflate 开关：false = 不提议压缩（排查中间盒误杀压缩帧/降低 CPU 用；
+   * 服务端不协商时压缩本就不生效）。缺省 = ws 库默认（提议压缩）。
+   */
+  perMessageDeflate?: boolean;
+  /**
+   * 本连接在隧道组内的角色（TunnelGroup 装配 attach leg 时标记）：影响断开日志字段
+   * 与终态错误（4410/重连耗尽）的日志级别——attach leg 由组语义接管，按 debug 降噪。
+   */
+  role?: 'primary' | 'attach';
   heartbeatIntervalMs: number;
+  /**
+   * 心跳判死宽容度（可选，默认 3）：连续该数量心跳周期完全静默（无任何入站帧，
+   * 含 pong/tunnel.ack）才判死。判死窗 = heartbeatIntervalMs × 本值。
+   * 非有限数/小于 1 视为未配置。链路长抖动被误判死时上调换取更慢的真死发现。
+   */
+  heartbeatMaxMissed?: number;
   connectTimeoutMs: number;
   reconnect: ReconnectOptions;
   logger: Logger;
 }
+
+/** 携带稳定错误码的错误（日志分级与组语义过滤用，不改变连接行为） */
+export interface CodedError extends Error {
+  code?: string;
+}
+
+/** 重连次数耗尽（primary 为终态；attach leg 由组语义接管降噪） */
+export const ERR_RECONNECT_EXHAUSTED = 'ERR_RECONNECT_EXHAUSTED';
+/** hostname 冲突（4409，老服务端终态） */
+export const ERR_HOSTNAME_CONFLICT = 'ERR_HOSTNAME_CONFLICT';
+/** attach 被拒（4410，目标不存在/已满/非多连接会话） */
+export const ERR_ATTACH_REJECTED = 'ERR_ATTACH_REJECTED';
+/** 主动关闭（close()/整组重建收尾）：供 TunnelGroup 区分"被关"与"连失败"，不排退避重试 */
+export const ERR_CLOSED_BY_CALLER = 'ERR_CLOSED_BY_CALLER';
+
+/**
+ * 帧轨迹记录（环形缓冲）：断开时倾倒进诊断日志，区分"流量触发被杀"（死前刚发过大帧）
+ * 与"空闲回收"（死前只有心跳）——中间盒杀连接场景的节律观测。
+ */
+interface FrameRecord {
+  at: number;
+  dir: 'tx' | 'rx';
+  kind: string;
+  len: number;
+}
+
+/** 帧轨迹环形缓冲上限：32 条足以覆盖"死前 1s 内"的突发形态，日志体积可控 */
+const RECENT_FRAMES_MAX = 32;
+
+/**
+ * 握手被拒（unexpected-response）时允许打印值的响应头白名单：
+ * 值仅限无敏感信息的头（防 Set-Cookie 泄浏览器会话 token）；其余头只记名字作中间盒指纹。
+ */
+const HANDSHAKE_RESPONSE_HEADER_ALLOWLIST = [
+  'server', 'content-type', 'content-length', 'location', 'via', 'date', 'retry-after', 'x-cache',
+];
 
 /** 隧道发送面（TunnelGroup 条带化的 leg 抽象）：Connection 天然实现 */
 export interface TunnelSender {
@@ -82,10 +140,21 @@ const FLOW_TARGET_DELAY_MS = 10_000;
 const FLOW_RATE_EWMA_ALPHA = 0.3;
 /** close() 时对端不配合关闭的强制 terminate 等待 */
 const CLOSE_FORCE_MS = 5000;
-/** 心跳判死：连续 N 个心跳周期无任何入站消息判定死连接（默认 30s × 3 = 90s；大流量下的入站活性由 tunnel.ack 兜底，见文件头） */
+/**
+ * 心跳判死缺省宽容度：连续 N 个心跳周期无任何入站消息判定死连接（默认 30s × 3 = 90s；
+ * 大流量下的入站活性由 tunnel.ack 兜底，见文件头）。可经 heartbeatMaxMissed 覆盖。
+ */
 const DEAD_AFTER_MISSED_HEARTBEATS = 3;
+
+/** 心跳判死宽容度取值：非有限数/小于 1 视为未配置，回落缺省（保证判死窗至少一个心跳周期） */
+function resolveMaxMissed(configured: number | undefined): number {
+  return configured !== undefined && Number.isFinite(configured) && configured >= 1
+    ? configured : DEAD_AFTER_MISSED_HEARTBEATS;
+}
 /** 坏帧降级预算（spec §7 帧级）：连续 N 帧解码失败才升级为隧道级协议错误断开 */
 const MAX_CONSECUTIVE_BAD_FRAMES = 5;
+/** 短命代判定阈值（缺省）：就绪后 5s 内被杀 = 风暴期热循环，重连须退避防再被杀 */
+const CHURN_GENERATION_MS = 5000;
 
 /** ws RawData 统一转 Buffer（Buffer/ArrayBuffer/Buffer[] 三态） */
 function toBuffer(data: WebSocket.RawData): Buffer {
@@ -104,12 +173,22 @@ export class Connection extends EventEmitter implements TunnelSender {
   private readyAt = 0;
   /** 最近一次 ack 分配的 tunnelId：重连时经 hello 回带请求复用；进程内存态，重启即遗忘 */
   private lastTunnelId: string | undefined;
+  /** 连续短命代计数（风暴退避指数底数；健康代存活 ≥ 阈值即归零） */
+  private churnCount = 0;
   /** 连续坏帧计数：成功解码任意帧即清零；新连接尝试从零开始 */
   private consecutiveBadFrames = 0;
   /** 坏帧升级 latch：升级为隧道级断开后，close 握手窗内到达的坏帧静默丢弃（防 ERROR 日志洪泛） */
   private badFrameEscalated = false;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  /** 断开诊断：最近帧环形缓冲（发送+接收），handleClose 倾倒（每次 attempt 清零） */
+  private readonly recentFrames: FrameRecord[] = [];
+  /** 握手协商结果（服务端回包 Sec-WebSocket-Extensions；'' = 未协商压缩） */
+  private negotiatedExtensions = '';
+  /** 最近一次 ping 发出时刻（pong 回程 RTT 观测；0 = 尚未发过） */
+  private lastPingAt = 0;
+  /** 最近一次 ping→pong 往返毫秒（断开日志的链路健康快照） */
+  private lastPongRttMs: number | undefined;
   /** 已发送数据帧字节累计（端到端在途量 = dataBytesSent - dataBytesAcked） */
   private dataBytesSent = 0;
   /** 服务端 tunnel.ack 回执的数据帧字节累计（单调取大） */
@@ -196,7 +275,9 @@ export class Connection extends EventEmitter implements TunnelSender {
   /** 发送控制帧；未就绪抛错（调用方只应在 ready 后调用） */
   sendControl(frame: ControlFrame): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('tunnel not ready');
-    this.ws.send(encodeControl(frame));
+    const buf = encodeControl(frame);
+    this.ws.send(buf);
+    this.recordFrame('tx', frame.type, buf.length);
   }
 
   /**
@@ -210,6 +291,7 @@ export class Connection extends EventEmitter implements TunnelSender {
     const encoded = encodeData(header, payload);
     this.dataBytesSent += encoded.length; // 端到端在途量记账（服务端按同口径累计回执）
     this.ws.send(encoded);
+    this.recordFrame('tx', header.kind, encoded.length);
     if (this.ws.bufferedAmount > HIGH_WATER_BYTES || this.flowWindowExceeded()) {
       this.startDrainPoll();
       return false;
@@ -242,7 +324,9 @@ export class Connection extends EventEmitter implements TunnelSender {
     this.closing = true;
     this.clearReconnectTimer();
     this.stopHeartbeat();
-    this.connectReject?.(new Error('connection closed by caller'));
+    const closedErr = new Error('connection closed by caller') as CodedError;
+    closedErr.code = ERR_CLOSED_BY_CALLER; // 供 TunnelGroup 区分"被关"与"连失败"（不排退避重试）
+    this.connectReject?.(closedErr);
     const ws = this.ws;
     this.readyState = false;
     if (!ws || ws.readyState === WebSocket.CLOSED) return;
@@ -264,8 +348,12 @@ export class Connection extends EventEmitter implements TunnelSender {
   /** 发起一次连接尝试并接线全部事件 */
   private attempt(): void {
     // maxPayload 显式对齐隧道帧上限契约（原为 ws 隐式默认 100MiB）：
-    // 对端发送护栏保证隧道帧不超限，此处是对协议失配的显式声明
-    const ws = new WebSocket(this.opts.gatewayUrl, { maxPayload: MAX_PAYLOAD_BYTES });
+    // 对端发送护栏保证隧道帧不超限，此处是对协议失配的显式声明；
+    // perMessageDeflate 缺省 true（ws 默认提议压缩，服务端不协商则不生效）
+    const ws = new WebSocket(this.opts.gatewayUrl, {
+      maxPayload: MAX_PAYLOAD_BYTES,
+      perMessageDeflate: this.opts.perMessageDeflate ?? true,
+    });
     this.ws = ws;
     this.consecutiveBadFrames = 0;
     this.badFrameEscalated = false;
@@ -275,6 +363,49 @@ export class Connection extends EventEmitter implements TunnelSender {
     this.flowRateBps = 0;
     this.lastRateSampleAt = 0;
     this.lastRateSampleBytes = 0;
+    this.negotiatedExtensions = '';
+    this.lastPingAt = 0;
+    this.lastPongRttMs = undefined;
+    this.recentFrames.length = 0;
+
+    // 握手观测：服务端接受时的响应头（debug 级，记录压缩协商结果——Sec-WebSocket-Extensions
+    // 是否回带 permessage-deflate，判定"中间盒误杀压缩帧"假设时第一眼要看它）
+    ws.on('upgrade', (res) => {
+      this.negotiatedExtensions = typeof res.headers['sec-websocket-extensions'] === 'string'
+        ? res.headers['sec-websocket-extensions'] : '';
+      this.opts.logger.debug('隧道握手完成', {
+        role: this.opts.role ?? 'primary',
+        statusCode: res.statusCode,
+        extensions: this.negotiatedExtensions || undefined,
+      });
+    });
+    // 握手被拒观测（线上 bad handshake 排查点）：非 101 响应 = 网关/中间盒改写升级。
+    // 记录状态码 + 响应头名全集（中间盒注入头即指纹）；值仅白名单，防 Set-Cookie 泄 token。
+    // ws 语义：挂了 unexpected-response 监听后库不再自动 abort（不 emit 'error'、不断 socket），
+    // 此处手动复刻默认行为——emit 与库一致的错误 → 销毁握手连接 → close 事件驱动内建重连
+    ws.on('unexpected-response', (req, res) => {
+      const headerNames = Object.keys(res.headers);
+      const safeValues: Record<string, string | string[] | undefined> = {};
+      for (const name of HANDSHAKE_RESPONSE_HEADER_ALLOWLIST) {
+        const v = res.headers[name];
+        if (v !== undefined) safeValues[name] = v;
+      }
+      this.opts.logger.warn('隧道握手被拒（unexpected-response）', {
+        role: this.opts.role ?? 'primary',
+        path: req.path,
+        statusCode: res.statusCode,
+        headerNames,
+        ...(Object.keys(safeValues).length > 0 ? { headers: safeValues } : {}),
+      });
+      const err = new Error(`Unexpected server response: ${res.statusCode}`);
+      // 复刻 ws abortHandshake/emitErrorAndClose 的默认行为（见 node_modules ws/lib/websocket.js）：
+      // ① 升级成功前 ws 不监听底层 socket，销毁 socket 不会触发 close 事件，必须显式 emitClose；
+      // ② error 消息与库无监听时的自动 abort 口径一致（S2 断言依赖该原文）
+      req.abort();
+      if (req.socket && !req.socket.destroyed) req.socket.destroy();
+      this.emit('error', err); // 走 Connection→Client 既有错误分级
+      (ws as unknown as { emitClose: () => void }).emitClose(); // close(1006) → handleClose → 退避重连
+    });
 
     ws.on('open', () => {
       // 过期/关闭守卫：closing 中或已被更新尝试取代的旧 ws，不得再发 hello
@@ -289,33 +420,38 @@ export class Connection extends EventEmitter implements TunnelSender {
         ...(this.lastTunnelId ? { tunnelId: this.lastTunnelId } : {}),
       };
       delete (client as { initialTunnelId?: string }).initialTunnelId; // 内部字段，不上线
-      ws.send(encodeControl({ type: 'hello', client }));
+      const hello = encodeControl({ type: 'hello', client });
+      ws.send(hello);
+      this.recordFrame('tx', 'hello', hello.length);
     });
 
     ws.on('message', (data: WebSocket.RawData, isBinary: boolean) => {
       // 过期/关闭守卫：closing 中或旧 ws 迟到的帧（如超时/close 后迟到的 hello.ack）一律丢弃
       if (this.closing || this.ws !== ws) return;
       this.lastActivityAt = Date.now(); // 任何入站消息都算活跃（心跳判死依据）
+      const buf = toBuffer(data);
       if (isBinary) {
         let decoded: { header: DataHeader; payload: Buffer };
         try {
-          decoded = decodeData(toBuffer(data));
+          decoded = decodeData(buf);
         } catch (err) {
           this.onBadFrame(ws, err);
           return;
         }
         this.consecutiveBadFrames = 0; // 成功解码即重置连续坏帧计数
+        this.recordFrame('rx', decoded.header.kind, buf.length);
         this.callChannelHandler(() => this.handlers.onData(decoded.header, decoded.payload));
         return;
       }
       let frame: ControlFrame;
       try {
-        frame = decodeControl(toBuffer(data).toString('utf8'));
+        frame = decodeControl(buf.toString('utf8'));
       } catch (err) {
         this.onBadFrame(ws, err);
         return;
       }
       this.consecutiveBadFrames = 0;
+      this.recordFrame('rx', frame.type, buf.length);
       this.handleControl(frame);
     });
 
@@ -324,8 +460,14 @@ export class Connection extends EventEmitter implements TunnelSender {
       if (this.ws !== ws) return;
       this.handleClose(code, reason);
     });
-    // 'error' 之后必有 'close'，重连逻辑集中在 handleClose
-    ws.on('error', (err: Error) => this.emit('error', err));
+    // 'error' 之后必有 'close'，重连逻辑集中在 handleClose。
+    // 主动关闭（closing）期间的 ws 级错误是预期现象——CONNECTING 态 close 触发的
+    // abortHandshake 必发 "WebSocket was closed before the connection was established"——
+    // 不得上抛污染 Client 错误分级（线上"隧道连接错误"误报修复）
+    ws.on('error', (err: Error) => {
+      if (this.closing) return;
+      this.emit('error', err);
+    });
   }
 
   /**
@@ -394,10 +536,16 @@ export class Connection extends EventEmitter implements TunnelSender {
       return;
     }
     if (frame.type === 'ping') {
-      this.ws?.send(encodeControl({ type: 'pong' }));
+      const pong = encodeControl({ type: 'pong' });
+      this.ws?.send(pong);
+      this.recordFrame('tx', 'pong', pong.length);
       return;
     }
-    if (frame.type === 'pong') return;
+    if (frame.type === 'pong') {
+      // rx 已由 message 层记录帧轨迹；此处只补记链路健康快照（ping→pong RTT）
+      if (this.lastPingAt > 0) this.lastPongRttMs = Date.now() - this.lastPingAt;
+      return;
+    }
     if (frame.type === 'tunnel.ack') {
       // 端到端流量回执：首个 ack 激活流量窗口（证明服务端支持）；bytes 单调取大防乱序回退
       this.flowAckActive = true;
@@ -423,21 +571,44 @@ export class Connection extends EventEmitter implements TunnelSender {
     this.callChannelHandler(() => this.handlers.onControl(frame));
   }
 
+  /** 帧轨迹记录（环形缓冲）：断开诊断倾倒用；超限丢最旧 */
+  private recordFrame(dir: FrameRecord['dir'], kind: string, len: number): void {
+    this.recentFrames.push({ at: Date.now(), dir, kind, len });
+    if (this.recentFrames.length > RECENT_FRAMES_MAX) this.recentFrames.shift();
+  }
+
   /** 关闭处理：4409/4410 终态不重连；其余按退避重连（closing 时不重连） */
   private handleClose(code: number, reason: Buffer): void {
     const wasReady = this.readyState;
     this.readyState = false;
     this.stopHeartbeat();
+    // 短命代观测（风暴退避依据）：本次就绪会话的存活时长；未就绪断开为 undefined
+    let generationMs: number | undefined;
     // 仅在曾建立会话（收到过 hello.ack）的断开才回调/发事件：
     // 从未 ready 的连接失败（如首连重试）不存在在途通道，上层无需中止
     if (wasReady) {
       // 断开诊断（线上中间件 synthesized 1006 close 杀连接的观测点）：
-      // code/reason 区分对端正常关闭(1000)/协议错误(1002)/异常断链(1006)，readyMs 给出存活节律
+      // code/reason 区分对端正常关闭(1000)/协议错误(1002)/异常断链(1006)，readyMs 给出存活节律；
+      // lastFrames 倾倒死前帧轨迹（区分流量触发 vs 空闲回收），inFlightBytes/bufferedAmount
+      // 给出断前积压，extensions 记录压缩协商结果（中间盒误杀压缩帧假设的判定依据）
+      const now = Date.now();
+      const frames = this.recentFrames.map((f) => ({
+        dir: f.dir, kind: f.kind, len: f.len, msAgo: now - f.at,
+      }));
       this.opts.logger.warn('隧道连接断开', {
         code,
         reason: reason.toString() || undefined,
-        readyMs: this.readyAt > 0 ? Date.now() - this.readyAt : undefined,
+        readyMs: this.readyAt > 0 ? now - this.readyAt : undefined,
+        role: this.opts.role ?? 'primary',
+        tunnelId: this.lastTunnelId,
+        extensions: this.negotiatedExtensions || undefined,
+        inFlightBytes: this.dataBytesSent - this.dataBytesAcked,
+        bufferedAmount: this.ws?.bufferedAmount ?? 0,
+        silentMs: now - this.lastActivityAt,
+        ...(this.lastPongRttMs !== undefined ? { lastPongRttMs: this.lastPongRttMs } : {}),
+        ...(frames.length > 0 ? { lastFrames: frames } : {}),
       });
+      generationMs = this.readyAt > 0 ? now - this.readyAt : undefined;
       this.readyAt = 0;
       this.handlers.onDisconnected();
       this.emit('disconnected');
@@ -447,8 +618,13 @@ export class Connection extends EventEmitter implements TunnelSender {
     if (code === 4409 || code === ATTACH_REJECT_CODE) {
       const err = new Error(code === 4409
         ? 'hostname conflict (4409): 同名客户端已在线'
-        : 'attach rejected (4410): 目标隧道不存在/已满/非多连接会话');
-      this.opts.logger.error(code === 4409 ? 'hostname 冲突，不再重连' : 'attach 被拒绝，不再重连', { hostname: this.opts.hello.hostname });
+        : 'attach rejected (4410): 目标隧道不存在/已满/非多连接会话') as CodedError;
+      err.code = code === 4409 ? ERR_HOSTNAME_CONFLICT : ERR_ATTACH_REJECTED;
+      const message = code === 4409 ? 'hostname 冲突，不再重连' : 'attach 被拒绝，不再重连';
+      // attach leg 的 4410 由 TunnelGroup 重试/槽位降级语义接管，按 debug 降噪；
+      // primary/单连接的终态保持 ERROR（外层据此落 error 态）
+      const log = this.opts.role === 'attach' ? this.opts.logger.debug : this.opts.logger.error;
+      log.call(this.opts.logger, message, { hostname: this.opts.hello.hostname });
       if (this.connectReject) this.connectReject(err);
       else {
         this.emit('error', err);
@@ -456,32 +632,55 @@ export class Connection extends EventEmitter implements TunnelSender {
       }
       return;
     }
-    this.scheduleReconnect(wasReady);
+    this.scheduleReconnect(wasReady, generationMs);
   }
 
   /**
-   * 重连调度：已就绪会话被杀立即重连一次；重连尝试自身失败才按 base * 2^attempts 退避
-   * （封顶 max，±50% 抖动）；maxRetries 耗尽按场景 reject 或报错停止
+   * 重连调度：已就绪会话被杀后，健康代（存活 ≥ churnThresholdMs）立即重连一次（连接刚刚
+   * 还健康，用户可见断窗压到 RTT 级）；短命代（就绪后很快被杀，风暴期热循环）按 churn 连击
+   * 指数退避（封顶 max，±50% 抖动）拉断风暴；重连尝试自身失败（服务不可达）才按 base * 2^attempts
+   * 退避防洪——防洪针对"连不上"与"连上就被杀"，不针对健康链路瞬断。maxRetries 耗尽按场景 reject 或报错停止
    */
-  private scheduleReconnect(wasReady: boolean): void {
+  private scheduleReconnect(wasReady: boolean, generationMs?: number): void {
     if (this.closing) return;
     if (this.attempts >= this.opts.reconnect.maxRetries) {
-      const err = new Error(`reconnect exhausted after ${this.attempts} attempts`);
+      const err = new Error(`reconnect exhausted after ${this.attempts} attempts`) as CodedError;
+      err.code = ERR_RECONNECT_EXHAUSTED; // 供外层/组语义降噪分级（attach leg 由 TunnelGroup 接管）
       if (this.connectReject) {
         this.connectReject(err);
       } else {
-        this.opts.logger.warn('重连次数耗尽，停止重试', { attempts: this.attempts });
+        const message = '重连次数耗尽，停止重试';
+        const meta = {
+          attempts: this.attempts,
+          ...(this.opts.role ? { role: this.opts.role } : {}),
+        };
+        // attach leg（maxRetries:0）的重连预算由组语义接管：终态日志按 debug 降噪（线上风暴期刷屏修复）
+        const log = this.opts.role === 'attach' ? this.opts.logger.debug : this.opts.logger.warn;
+        log.call(this.opts.logger, message, meta);
         this.emit('error', err);
         this.emit('fatal', err); // 已就绪会话的终态失败：不再重试，外层落 error 态
       }
       return;
     }
     const { baseDelayMs, maxDelayMs } = this.opts.reconnect;
-    const exp = Math.min(baseDelayMs * 2 ** this.attempts, maxDelayMs);
-    // 已就绪会话被杀后的首次重连立即发起（线上移动端降级）：中间盒杀连接/瞬断时连接刚刚
-    // 还健康，立即重试把用户可见断窗从 0.5-1s 压到 RTT 级；重连尝试自身失败（服务不可达）
-    // 才进入指数退避防洪——防洪针对的是"连不上"，不是"被杀"
-    const delay = wasReady ? 0 : exp * (0.5 + Math.random() * 0.5);
+    let delay: number;
+    if (wasReady) {
+      const threshold = this.opts.reconnect.churnThresholdMs ?? CHURN_GENERATION_MS;
+      const churn = threshold > 0 && generationMs !== undefined && generationMs < threshold;
+      if (churn) {
+        // 短命代被杀：零延迟重连只会被再杀（线上实测代寿命 0.2-1.4s 连续绞杀），
+        // 按连击数指数退避拉断风暴；健康代存活 ≥ 阈值被杀仍是"连接刚刚还健康"，立即重试安全
+        this.churnCount += 1;
+        const exp = Math.min(baseDelayMs * 2 ** (this.churnCount - 1), maxDelayMs);
+        delay = exp * (0.5 + Math.random() * 0.5);
+      } else {
+        this.churnCount = 0;
+        delay = 0;
+      }
+    } else {
+      const exp = Math.min(baseDelayMs * 2 ** this.attempts, maxDelayMs);
+      delay = exp * (0.5 + Math.random() * 0.5);
+    }
     this.attempts += 1;
     this.opts.logger.info('隧道重连中', { attempts: this.attempts, delayMs: Math.round(delay) });
     this.reconnectTimer = setTimeout(() => {
@@ -499,15 +698,20 @@ export class Connection extends EventEmitter implements TunnelSender {
    */
   private startHeartbeat(): void {
     this.stopHeartbeat();
+    const maxMissed = resolveMaxMissed(this.opts.heartbeatMaxMissed);
     this.heartbeatTimer = setInterval(() => {
       const silentMs = Date.now() - this.lastActivityAt;
-      if (silentMs > DEAD_AFTER_MISSED_HEARTBEATS * this.opts.heartbeatIntervalMs) {
-        this.opts.logger.warn('心跳超时，判定死连接', { silentMs });
+      const deadAfterMs = maxMissed * this.opts.heartbeatIntervalMs;
+      if (silentMs > deadAfterMs) {
+        this.opts.logger.warn('心跳超时，判定死连接', { silentMs, deadAfterMs, maxMissed });
         this.ws?.terminate();
         return;
       }
       try {
-        this.ws?.send(encodeControl({ type: 'ping' }));
+        const ping = encodeControl({ type: 'ping' });
+        this.ws?.send(ping);
+        this.lastPingAt = Date.now();
+        this.recordFrame('tx', 'ping', ping.length);
       } catch {
         // 发送失败由 close 事件兜底走重连
       }

@@ -93,6 +93,17 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
   let consecutiveBadFrames = 0;
   /** 坏帧升级 latch：升级为 1002 后 close 握手窗内到达的坏帧静默丢弃（防 ERROR 日志洪泛） */
   let badFrameEscalated = false;
+  // ---- per-leg 生命周期统计（断开日志诊断，线上 1006 杀连接排查观测点）----
+  /** hello/attach 回带的目标 tunnelId（pre-hello 断开时 close 日志回填用） */
+  let requestedId: string | undefined;
+  /** 本 leg 就绪时刻（hello 处理完成/attach 接受；0 = 未就绪） */
+  let legReadyAt = 0;
+  /** 最近一次入站消息时刻（断开时算 silentMs，区分空闲回收 vs 流量触发） */
+  let lastRxAt = 0;
+  /** 最近一次成功解码的入站帧（kind = 协议帧类型/数据帧 kind；不含帧内容防泄 token） */
+  let lastRxFrame: { kind: string; len: number } | undefined;
+  /** 本 leg 角色（primary/attach 就绪后确定；close 日志标注） */
+  let legRole: 'primary' | 'attach' | 'pre-hello' = 'pre-hello';
 
   // hello 超时：握手后 helloTimeoutMs 内未收到合法 hello
   const helloTimer = setTimeout(() => {
@@ -102,6 +113,7 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
 
   ws.on('message', (raw: RawData, isBinary: boolean) => {
     const buf = toBuffer(raw);
+    lastRxAt = Date.now();
     if (!session || !activeLeg) {
       // 首条消息必须是 hello 控制帧
       if (isBinary) {
@@ -110,7 +122,6 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
       }
       let hostname: string;
       let defaultPath: string;
-      let requestedId: string | undefined;
       let flowAck = false;
       let attach = false;
       let multiConnCount: number | undefined;
@@ -145,6 +156,9 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
         ctx.logger.info('隧道 attach 接入', { hostname: target.hostname, tunnelId: target.tunnelId, legs: target.legCount });
         session = target; // 后续 message/close 统一走下方已就绪路由（带 leg）
         activeLeg = leg;
+        legReadyAt = Date.now();
+        legRole = 'attach';
+        lastRxFrame = { kind: 'hello', len: buf.length };
         return;
       }
       // primary 路：新建隧道（声明 multiConn.count >= 2 协商为 striped 组，否则 legacy 单连接语义）
@@ -163,6 +177,9 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
       ws.send(encodeControl(striped
         ? { type: 'hello.ack', tunnelId, multiConn: { max: maxLegs } }
         : { type: 'hello.ack', tunnelId }));
+      legReadyAt = Date.now();
+      legRole = 'primary';
+      lastRxFrame = { kind: 'hello', len: buf.length };
       ctx.logger.info('隧道接入', { hostname, tunnelId, reused: tunnelId === requestedId });
       return;
     }
@@ -171,11 +188,13 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
       if (isBinary) {
         const { header, payload } = decodeData(buf);
         consecutiveBadFrames = 0; // 成功解码即重置连续坏帧计数
+        lastRxFrame = { kind: header.kind, len: buf.length };
         // ack 流量回执记账在 handleData 内按到达 leg 进行（含帧头，与客户端发送记账同口径）
         session.handleData(header, payload, activeLeg, buf.length);
       } else {
         const frame = decodeControl(buf.toString('utf8'));
         consecutiveBadFrames = 0;
+        lastRxFrame = { kind: frame.type, len: buf.length };
         session.handleControl(frame, activeLeg);
       }
     } catch (err) {
@@ -206,8 +225,23 @@ function onTunnelConnection(ws: WebSocket, ctx: TunnelContext): void {
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code: number, reason: Buffer) => {
     clearTimeout(helloTimer);
+    // per-leg 断开诊断（线上 1006 杀连接排查的服务端观测点）：code/reason 区分
+    // 正常关闭/协议错误/异常断链，readyMs 给存活节律，silentMs/lastRxFrame 区分
+    // 空闲回收（死前只有 ping）vs 流量触发（死前刚收到大帧）——与客户端 lastFrames 对表
+    const now = Date.now();
+    ctx.logger.info('隧道 leg 关闭', {
+      hostname: session?.hostname,
+      tunnelId: session?.tunnelId ?? requestedId,
+      role: legRole,
+      legs: session?.legCount,
+      code,
+      reason: reason.toString() || undefined,
+      readyMs: legReadyAt > 0 ? now - legReadyAt : undefined,
+      silentMs: lastRxAt > 0 ? now - lastRxAt : undefined,
+      ...(lastRxFrame ? { lastRxFrame } : {}),
+    });
     if (session && activeLeg) session.legDown(activeLeg); // legDown 幂等：整组 teardown 一次
     else session?.teardown(); // 理论不可达（activeLeg 必随 session 同设），防御保留
   });

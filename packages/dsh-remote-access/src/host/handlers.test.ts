@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { loadConfig } from './config';
+import { loadConfig, saveConfig } from './config';
 import { ConnectionManager } from './connection-manager';
 import { createHandlers, type Handler } from './handlers';
 
@@ -51,6 +51,21 @@ describe('remote-save-config', () => {
     const res = await call('remote-save-config', { hostname: 'my-pc-2' });
     expect(res.ok).toBe(true);
     expect(loadConfig(home)).toEqual({ hostname: 'my-pc-2', token: 'aB3x9Kq2', gateway: 'https://gw.example.com', compress: false });
+  });
+
+  // yaml 手工配置的可选字段不得被 UI 表单保存静默清掉（表单不携带这些字段）
+  it('save 保留 yaml 手工配置的可选字段（connections/heartbeatIntervalMs/tunnelPerMessageDeflate）', async () => {
+    // 可选字段仅经 yaml 手工配置进入（表单/API 参数不携带它们）
+    saveConfig(home, {
+      hostname: 'my-pc', token: 'aB3x9Kq2', gateway: 'https://gw.example.com', compress: true,
+      connections: 1, heartbeatIntervalMs: 10000, tunnelPerMessageDeflate: false,
+    });
+    // 纯 UI 表单保存（不带可选字段）→ 可选字段原样保留
+    const res = await call('remote-save-config', { hostname: 'my-pc', token: 'aB3x9Kq2', gateway: 'https://gw.example.com', compress: false });
+    expect(res.ok).toBe(true);
+    expect(loadConfig(home)).toMatchObject({
+      connections: 1, heartbeatIntervalMs: 10000, tunnelPerMessageDeflate: false, compress: false,
+    });
   });
 
   it('非法网关地址：ok=false 且不写文件', async () => {

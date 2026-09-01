@@ -129,6 +129,31 @@ describe('Client 生命周期与帧路由', () => {
     await client.close();
     await gw.close();
   });
+
+  // 线上噪音降噪：attach leg/单连接的"重连耗尽"终态经 'fatal' 由外层落 error 态，
+  // 'error' 事件的日志降 debug（事件本身仍上抛，监听契约不变）
+  it('重连耗尽降噪：error 事件日志降 debug，终态经 fatal 由外层处理', async () => {
+    const gw = new MiniGateway();
+    const logs: Array<{ level: string; message: string }> = [];
+    const capture = (level: string) => (message: string): void => {
+      logs.push({ level, message });
+    };
+    const client = new Client({
+      ...BASE, upstreamUrl: 'http://127.0.0.1:1', gatewayUrl: gw.url,
+      reconnect: { maxRetries: 0 }, // 已就绪会话被杀后首个重连即耗尽
+      logger: { debug: capture('debug'), info: capture('info'), warn: capture('warn'), error: capture('error') },
+    });
+    client.on('error', () => {});
+    const fatals: Error[] = [];
+    client.on('fatal', (err: Error) => fatals.push(err));
+    await client.connect();
+    gw.sendIllegalCloseFrame(); // 中间盒合成 1006 close 帧 → 断 → 重连耗尽
+    await vi.waitFor(() => expect(fatals).toHaveLength(1), { timeout: 5000 });
+    expect(logs.some((l) => l.level === 'debug' && l.message === '重连次数耗尽（终态由外层/组语义处理）')).toBe(true);
+    expect(logs.some((l) => l.level === 'error' && l.message === '隧道连接错误')).toBe(false);
+    await client.close();
+    await gw.close();
+  });
 });
 
 describe('Client 多连接装配（connections + legCount）', () => {

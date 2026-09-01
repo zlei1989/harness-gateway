@@ -49,6 +49,15 @@ DSH web 自身有浏览器认证（需访问它启动时打印的 `/?token=…` 
 
 保存于 `~/.dsh/.remote-access.yaml`（hostname / token / gateway；enabled 不持久化）。
 
+可选字段（仅 yaml 手工配置，UI 表单不携带、保存时保留）：
+
+- `connections`: 隧道连接数（默认 4；1 = 单连接 legacy 模式）。
+- `heartbeatIntervalMs`: 心跳间隔毫秒（默认 30000）。链路中间盒/反代的空闲超时
+  短于 30s 时必须调小到其一半以下，否则隧道被周期性回收（表现：规律性断连重连）。
+- `tunnelPerMessageDeflate`: 隧道 WS 压缩开关（默认开 = 提议 permessage-deflate，
+  服务端不协商则不生效）。排查「移动端一访问就断」等中间盒误杀压缩帧场景时置
+  `false` 对照验证。
+
 ## 协议推断
 
 裸域名 → ws 隧道 + http 选择页；https:// 或 wss:// → wss/https。只取 origin。

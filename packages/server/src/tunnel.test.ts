@@ -12,7 +12,7 @@ import { createServer, type Server } from 'node:http';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
 
-import { type ControlFrame, encodeControl, type HelloAckFrame } from './protocol';
+import { type ControlFrame, encodeControl, encodeData, type HelloAckFrame } from './protocol';
 import { TunnelRegistry } from './session';
 import { attachTunnelHandler } from './tunnel';
 
@@ -84,6 +84,45 @@ describe('隧道接入', () => {
     expect(tunnelId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
     expect(tunnels.list()).toEqual([{ tunnelId, hostname: 'pc-a', defaultPath: '/dash' }]);
     ws.close();
+  });
+
+  // per-leg 断开诊断（线上 1006 杀连接排查的服务端观测点）：code/reason/readyMs/silentMs/
+  // lastRxFrame/role 必须留痕，与客户端"隧道连接断开"日志对表定位杀连接方
+  it('断开诊断：leg 关闭记 code/reason/readyMs/silentMs/lastRxFrame/role', async () => {
+    const infos: { msg: string; meta?: Record<string, unknown> }[] = [];
+    const logger = {
+      debug() {},
+      info(msg: string, meta?: unknown) {
+        infos.push({ msg, meta: meta as Record<string, unknown> });
+      },
+      warn() {}, error() {},
+    } as unknown as import('./logger').Logger;
+    await setup(200, logger);
+    const ws = connectWs();
+    await new Promise<void>((r) => ws.on('open', r));
+    await helloAck(ws, 'pc-a');
+    await new Promise((r) => setTimeout(r, 30)); // 拉开 readyMs 使可断言 >0
+    // 发一条数据帧：kind 进 lastRxFrame（死前帧形态，区分流量触发 vs 空闲回收）
+    ws.send(encodeData({ channelId: 999, kind: 'http.body' }, Buffer.alloc(64)));
+    await new Promise((r) => setTimeout(r, 30));
+    ws.close(1000, 'bye');
+    const deadline = Date.now() + 5000;
+    while (!infos.some((e) => e.msg === '隧道 leg 关闭') && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const entry = infos.find((e) => e.msg === '隧道 leg 关闭');
+    expect(entry).toBeDefined();
+    expect(entry?.meta).toMatchObject({
+      role: 'primary',
+      code: 1000,
+      reason: 'bye',
+      legs: 1,
+      lastRxFrame: { kind: 'http.body' },
+    });
+    const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    expect(entry?.meta?.tunnelId).toMatch(uuidRe);
+    expect((entry?.meta?.readyMs as number) ?? 0).toBeGreaterThan(0);
+    expect(entry?.meta?.silentMs).toBeTypeOf('number');
   });
 
   it('同名并存：两条同名隧道各分不同 tunnelId 同时在线（不再有 4409 仲裁）', async () => {

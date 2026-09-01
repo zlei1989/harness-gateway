@@ -61,6 +61,8 @@ export class MockGateway {
   closePrimaryCode: number | undefined;
   /** true 时 attach hello 回同一 tunnelId 的 ack（加入既有隧道组） */
   attachOk = false;
+  /** attach hello.ack 延迟毫秒数（0 = 立即）：把 attach leg 钉在"已连上未就绪"窗（跨代重建竞态用） */
+  attachAckDelayMs = 0;
   /** 最后一个 hello 帧（协商断言用） */
   lastHello: HelloFrame | null = null;
   /** attach hello 计数（重试/降级断言用） */
@@ -134,11 +136,13 @@ export class MockGateway {
         }
         if (this.attachOk) {
           // attach 成功：回带同一 tunnelId（加入既有隧道组）
-          ws.send(encodeControl({
+          const reply = () => ws.send(encodeControl({
             type: 'hello.ack',
             tunnelId: frame.client.tunnelId ?? 'tid-mock-1',
             multiConn: this.multiConnAck,
           }));
+          if (this.attachAckDelayMs > 0) setTimeout(reply, this.attachAckDelayMs);
+          else reply();
           return;
         }
       } else {
@@ -273,6 +277,11 @@ export class MockGateway {
     if (this.conns.length < 2) return;
     const idx = 1 + Math.floor(Math.random() * (this.conns.length - 1));
     this.conns[idx]?.terminate();
+  }
+
+  /** 只断首条（primary）连接：整组重建触发点（跨代重建竞态场景） */
+  dropPrimary(): void {
+    this.conns[0]?.terminate();
   }
 
   /** 断开隧道（模拟网关宕机/断线）：断开全部连接 */

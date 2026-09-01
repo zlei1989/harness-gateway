@@ -27,6 +27,16 @@ export interface RemoteAccessConfig {
    * 必须调小到其一半以下，否则隧道被周期性回收（表现：规律性断连重连，详见网关 README）
    */
   heartbeatIntervalMs?: number;
+  /**
+   * 心跳判死宽容度（可选；默认 3）。判死窗 = heartbeatIntervalMs × 本值，期间任何入站帧
+   * （pong/tunnel.ack/数据）都会重置静默计时。链路长抖动被误判死时上调（代价：真死发现更慢）
+   */
+  heartbeatMaxMissed?: number;
+  /**
+   * 隧道 WS permessage-deflate 开关（可选；默认开 = 客户端提议压缩，服务端不协商则不生效）。
+   * false = 不提议压缩：排查路径上中间盒误杀压缩帧（RSV1）导致的"有流量就断"时置 false 对照验证。
+   */
+  tunnelPerMessageDeflate?: boolean;
 }
 
 export const DEFAULT_GATEWAY = 'harness-gateway.7qbjs.com';
@@ -64,6 +74,13 @@ export function loadConfig(homeDir: string): RemoteAccessConfig {
     heartbeatIntervalMs: typeof raw.heartbeatIntervalMs === 'number'
       && Number.isFinite(raw.heartbeatIntervalMs) && raw.heartbeatIntervalMs > 0
       ? raw.heartbeatIntervalMs : undefined,
+    // 同上：< 1 的宽容度会让判死窗小于一个心跳周期（必然误杀），视为未配置由客户端缺省 3 接管
+    heartbeatMaxMissed: typeof raw.heartbeatMaxMissed === 'number'
+      && Number.isFinite(raw.heartbeatMaxMissed) && raw.heartbeatMaxMissed >= 1
+      ? raw.heartbeatMaxMissed : undefined,
+    // 仅 boolean 透传；缺省由 gateway-client（ws 库默认提议压缩）接管
+    tunnelPerMessageDeflate: typeof raw.tunnelPerMessageDeflate === 'boolean'
+      ? raw.tunnelPerMessageDeflate : undefined,
   };
   // 补全了缺省字段则落盘（token 等默认值生成一次后稳定）
   if (cfg.hostname !== raw.hostname || cfg.token !== raw.token || cfg.gateway !== raw.gateway

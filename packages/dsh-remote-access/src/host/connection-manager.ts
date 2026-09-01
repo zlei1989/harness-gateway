@@ -65,6 +65,8 @@ export class ConnectionManager {
         hostname,
         token: cfg.token,
         compress: cfg.compress,
+        // 隧道 WS 压缩开关透传（缺省 = gateway-client/ws 默认提议压缩）
+        perMessageDeflate: cfg.tunnelPerMessageDeflate,
         // DSH 浏览器认证桥接：落地路径携带启动令牌（每次 enable 现取，令牌随进程轮换）；
         // 缺省传 undefined，Client 默认 '/'（与下方 connections 同一透传模式）
         defaultPath: this.deps.defaultPath?.(),
@@ -72,6 +74,8 @@ export class ConnectionManager {
         connections: cfg.connections,
         // 心跳间隔原样透传：undefined 时 Client 默认 30s（前置反代空闲超时更短时经 yaml 调小）
         heartbeatIntervalMs: cfg.heartbeatIntervalMs,
+        // 判死宽容度原样透传：undefined 时 Client 默认 3（判死窗 = 心跳间隔 × 3）
+        heartbeatMaxMissed: cfg.heartbeatMaxMissed,
         logger: createPluginLogger(),
       });
       this.client = client;

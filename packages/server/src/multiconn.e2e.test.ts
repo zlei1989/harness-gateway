@@ -182,11 +182,15 @@ describe('多连接真机 e2e', () => {
     const legs = serverSession(tunnelId).legs;
     const victim = legs[1];
     if (!victim) throw new Error('attach leg missing');
-    victim.ws.terminate();
     // 任一 leg 断 = 整组 teardown（spec §4.4）：primary 内建重连带 tunnelId 回带复用，
-    // attach leg 重新挂满。先等断开真实发生（terminate 的 close 帧异步到达，
-    // 立即等 legCount===4 会被断开前的旧值骗过），再等重建回 4
-    await vi.waitFor(() => expect(client.legCount).toBeLessThan(4), { timeout: 10_000, interval: 20 });
+    // attach leg 重新挂满。teardown 的确定性信号是 Client 的 'disconnected' 事件
+    // （由 primary 单点上抛，每次 teardown 恰好一次）——原 legCount<4 瞬时观测依赖
+    // 20ms 轮询窗口，而 loopback 下整组 4→0→4 重建可在相邻两次采样间完成（实测 ~32ms），
+    // 竞态漏判会一直看到旧值 4
+    let disconnected = 0;
+    client.on('disconnected', () => { disconnected += 1; });
+    victim.ws.terminate();
+    await vi.waitFor(() => expect(disconnected).toBe(1), { timeout: 10_000, interval: 10 });
     await waitLegs(client, 4);
     // 服务端注册表同步确认（ack 先于注册返回，双保险防竞态）
     await vi.waitFor(() => expect(serverSession(tunnelId).legCount).toBe(4), { timeout: 10_000, interval: 20 });

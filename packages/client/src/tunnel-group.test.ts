@@ -107,4 +107,36 @@ describe('TunnelGroup', () => {
     await vi.waitFor(() => expect(disconnected).toBe(1));
     await vi.waitFor(() => expect(g.readyLegCount).toBe(4)); // 整组重建
   });
+
+  // 跨代幽灵重试回归：重建收掉 CONNECTING 中的 attach leg 时，其 connect() 以
+  // 'connection closed by caller' 拒绝——不得误排退避重试：旧代幽灵会覆盖新代槽位、
+  // 留下孤儿连接（线上多代风暴期多余 attach 握手/孤儿 leg 的根因）
+  it('重建收掉 CONNECTING 中的 attach leg：不产生跨代幽灵重试，组收敛到目标 leg 数', async () => {
+    gateway.multiConnAck = { max: 16 };
+    gateway.attachOk = true;
+    gateway.attachAckDelayMs = 300; // 把 attach leg 钉在"已连上未就绪"窗（hello 已发、ack 未回）
+    const g = makeGroup(2);
+    await g.connect(); // primary 就绪；attach 后台 CONNECTING
+    await vi.waitFor(() => expect(gateway.connectionCount).toBe(2)); // attach 已连上（未 ack）
+    gateway.dropPrimary(); // 整组重建：closeAttachLegs 主动关掉 CONNECTING 的 attach leg
+    await vi.waitFor(() => expect(g.readyLegCount).toBe(2), { timeout: 5000 }); // 重建收敛
+    await new Promise((r) => setTimeout(r, 400)); // 幽灵重试窗口（baseDelayMs 50）已过
+    expect(gateway.attachHelloCount).toBe(2); // 首代 1 + 重建代 1，无幽灵 hello
+    expect(gateway.connectionCount).toBe(4); // 各代 primary+attach 各 2，无孤儿连接
+  });
+
+  // attach leg 终态错误（maxRetries:0 → 重连耗尽）由组语义接管（整组重建/槽位降级），
+  // 不得经 'error' 上抛让 Client 记 ERROR 噪音——线上"重连次数耗尽"刷屏的降噪回归锁
+  it('attach leg 重连耗尽：error 事件不上抛（组语义接管），组整组重建恢复', async () => {
+    gateway.multiConnAck = { max: 16 };
+    gateway.attachOk = true;
+    const g = makeGroup(2);
+    await g.connect();
+    await vi.waitFor(() => expect(g.readyLegCount).toBe(2));
+    const errors: Array<Error & { code?: string }> = [];
+    g.on('error', (err: Error) => errors.push(err as Error & { code?: string }));
+    gateway.dropOneConnection(); // 断 attach leg → 该 leg maxRetries=0 立即耗尽（终态码错误）
+    await vi.waitFor(() => expect(g.readyLegCount).toBe(2), { timeout: 5000 }); // 整组重建
+    expect(errors.some((e) => e.code === 'ERR_RECONNECT_EXHAUSTED')).toBe(false);
+  });
 });
